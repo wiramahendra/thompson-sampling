@@ -1,0 +1,17 @@
+[package]
+name = "thompson-sim"
+description = "Regret and throughput harness for the thompson-sampling crate."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thompson-sampling = { path = "../thompson-sampling" }
+rand = { workspace = true, features = ["small_rng"] }
+
+[[bin]]
+name = "thompson-sim"
+path = "src/main.rs"

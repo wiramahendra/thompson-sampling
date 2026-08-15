@@ -1,0 +1,428 @@
+package thompson
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"sort"
+	"sync"
+)
+
+// ErrNoArms is returned by Select when no arms are registered.
+var ErrNoArms = errors.New("thompson: no arms registered")
+
+// SelectionKind selects how an arm is chosen from the current posteriors.
+type SelectionKind int
+
+const (
+	// ThompsonSelection draws once per arm and takes the argmax.
+	ThompsonSelection SelectionKind = iota
+
+	// UCBRegularized adds a UCB-style bonus to under-explored arms.
+	//
+	// Redundant under an exact sampler, which already explores optimally in the
+	// Bayesian sense. It earns its keep only when paired with an approximate
+	// sampler that under-explores, which is the usual reason it appears.
+	UCBRegularized
+
+	// PhasedSelection round-robins every arm to a fixed pull count, then
+	// samples as normal. Cold-start protection for settings where an unmeasured
+	// arm is genuinely dangerous rather than merely unknown.
+	PhasedSelection
+)
+
+// Selection configures the selection strategy.
+type Selection struct {
+	Kind SelectionKind
+	// C is the UCB bonus coefficient.
+	C float64
+	// UntilPulls is the pull count at which the UCB bonus stops applying.
+	UntilPulls uint64
+	// Bootstrap and MinPullsForExploit gate PhasedSelection. The effective
+	// quota is the larger of the two.
+	Bootstrap          uint64
+	MinPullsForExploit uint64
+}
+
+// Config configures a Policy.
+type Config struct {
+	UpdateRule UpdateRule
+	Reward     RewardPolicy
+	WarmStart  WarmStart
+	Selection  Selection
+	// Discount, when non-zero, is applied to every posterior after each
+	// observation. Set it when arm quality drifts.
+	Discount float64
+}
+
+// DefaultConfig returns a stationary, exact, family-warm-started configuration.
+func DefaultConfig() Config {
+	return Config{
+		UpdateRule: DefaultUpdateRule(),
+		Reward:     DefaultRewardPolicy(),
+		WarmStart:  DefaultWarmStart(),
+		Selection:  Selection{Kind: ThompsonSelection},
+	}
+}
+
+// Arm is one selectable option and everything learned about it.
+type Arm struct {
+	ID               string    `json:"id"`
+	Posterior        Posterior `json:"posterior"`
+	CumulativeReward float64   `json:"cumulative_reward"`
+	WarmStarted      bool      `json:"warm_started"`
+}
+
+// EmpiricalMean returns the mean of raw rewards observed, and whether the arm
+// has been pulled. It differs from the posterior mean: it is unaffected by the
+// prior and by the update rule's discretisation.
+func (a *Arm) EmpiricalMean() (float64, bool) {
+	if a.Posterior.Pulls == 0 {
+		return 0, false
+	}
+	return a.CumulativeReward / float64(a.Posterior.Pulls), true
+}
+
+// ArmStats is a read-only summary of an arm.
+type ArmStats struct {
+	ID             string  `json:"id"`
+	Alpha          float64 `json:"alpha"`
+	Beta           float64 `json:"beta"`
+	Pulls          uint64  `json:"pulls"`
+	PosteriorMean  float64 `json:"posterior_mean"`
+	EmpiricalMean  float64 `json:"empirical_mean"`
+	HasObservation bool    `json:"has_observation"`
+	CredibleWidth  float64 `json:"credible_width"`
+	WarmStarted    bool    `json:"warm_started"`
+}
+
+// Policy is a Thompson Sampling policy over a mutable set of arms. It is safe
+// for concurrent use.
+//
+// A single mutex guards everything. The obvious alternative — a policy lock
+// plus a lock per arm — invites a lock-order inversion the moment one method
+// takes them policy-first and another takes them arm-first, and that deadlock
+// only shows up under production concurrency. Arms are never handed out by
+// pointer to callers, so one lock is sufficient and cheap.
+type Policy struct {
+	mu         sync.Mutex
+	arms       map[string]*Arm
+	order      []string // sorted arm IDs, so iteration is deterministic
+	config     Config
+	sampler    Sampler
+	totalPulls uint64
+}
+
+// New creates an empty policy.
+func New(config Config, sampler Sampler) *Policy {
+	if sampler == nil {
+		sampler = ExactSampler{}
+	}
+	return &Policy{
+		arms:    make(map[string]*Arm),
+		config:  config,
+		sampler: sampler,
+	}
+}
+
+// NewDefault creates a policy with default configuration, the exact sampler,
+// and the given arms.
+func NewDefault(armIDs ...string) *Policy {
+	p := New(DefaultConfig(), ExactSampler{})
+	for _, id := range armIDs {
+		p.AddArm(id)
+	}
+	return p
+}
+
+// AddArm registers an arm using the configured warm-start strategy, returning
+// the prior applied and whether the arm was new.
+func (p *Policy) AddArm(id string) (InformedPrior, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.arms[id]; exists {
+		return InformedPrior{}, false
+	}
+	prior := priorFor(p.config.WarmStart, id, p.arms)
+	p.insertLocked(id, prior)
+	return prior, true
+}
+
+// AddArmWithPrior registers an arm with an explicit prior, overriding the
+// warm-start strategy. It reports whether the arm was new.
+func (p *Policy) AddArmWithPrior(id string, prior InformedPrior) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.arms[id]; exists {
+		return false
+	}
+	p.insertLocked(id, prior)
+	return true
+}
+
+func (p *Policy) insertLocked(id string, prior InformedPrior) {
+	p.arms[id] = &Arm{
+		ID:          id,
+		Posterior:   prior.Posterior(),
+		WarmStarted: prior != NewInformedPrior(1, 1),
+	}
+	p.order = append(p.order, id)
+	sort.Strings(p.order)
+}
+
+// RemoveArm removes an arm, reporting whether it was present.
+func (p *Policy) RemoveArm(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.arms[id]; !exists {
+		return false
+	}
+	delete(p.arms, id)
+	for i, existing := range p.order {
+		if existing == id {
+			p.order = append(p.order[:i], p.order[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+// HasArm reports whether an arm is registered.
+func (p *Policy) HasArm(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, exists := p.arms[id]
+	return exists
+}
+
+// Len returns the number of registered arms.
+func (p *Policy) Len() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.arms)
+}
+
+// TotalPulls returns the total observations recorded across all arms.
+func (p *Policy) TotalPulls() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.totalPulls
+}
+
+// SamplerName returns the active sampler's name.
+func (p *Policy) SamplerName() string { return p.sampler.Name() }
+
+// Select chooses an arm.
+//
+// It does not mutate learned state: nothing is learned until the outcome comes
+// back through Record or RecordOutcome. Selecting without recording is
+// legitimate — a request may be cancelled — and simply teaches nothing.
+func (p *Policy) Select(rng *rand.Rand) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.arms) == 0 {
+		return "", ErrNoArms
+	}
+
+	switch p.config.Selection.Kind {
+	case UCBRegularized:
+		return p.argmaxUCBLocked(rng), nil
+
+	case PhasedSelection:
+		// Both thresholds gate the same thing, so the binding one is the
+		// larger. Exploiting only among arms past the threshold is a trap: the
+		// first arm to cross becomes the only eligible one, wins every
+		// subsequent round, and the arms behind it never advance.
+		quota := p.config.Selection.Bootstrap
+		if p.config.Selection.MinPullsForExploit > quota {
+			quota = p.config.Selection.MinPullsForExploit
+		}
+		if id, ok := p.leastPulledBelowLocked(quota); ok {
+			return id, nil
+		}
+		return p.argmaxSampledLocked(rng), nil
+
+	default:
+		return p.argmaxSampledLocked(rng), nil
+	}
+}
+
+func (p *Policy) argmaxSampledLocked(rng *rand.Rand) string {
+	best, bestScore := "", math.Inf(-1)
+	for _, id := range p.order {
+		score := p.sampler.Sample(rng, p.arms[id].Posterior)
+		if best == "" || score > bestScore {
+			best, bestScore = id, score
+		}
+	}
+	return best
+}
+
+func (p *Policy) argmaxUCBLocked(rng *rand.Rand) string {
+	// Log(totalPulls) is undefined at zero and negative at one, either of which
+	// poisons every comparison with NaN. Shifting by one keeps the bonus finite
+	// and non-negative from the very first round.
+	logTotal := math.Log(float64(p.totalPulls + 1))
+	sel := p.config.Selection
+
+	best, bestScore := "", math.Inf(-1)
+	for _, id := range p.order {
+		arm := p.arms[id]
+		score := p.sampler.Sample(rng, arm.Posterior)
+		switch {
+		case arm.Posterior.Pulls >= sel.UntilPulls:
+			// no bonus
+		case arm.Posterior.Pulls == 0:
+			score = math.Inf(1)
+		default:
+			score += sel.C * math.Sqrt(logTotal/float64(arm.Posterior.Pulls))
+		}
+		if best == "" || score > bestScore {
+			best, bestScore = id, score
+		}
+	}
+	return best
+}
+
+func (p *Policy) leastPulledBelowLocked(threshold uint64) (string, bool) {
+	best, bestPulls := "", uint64(math.MaxUint64)
+	for _, id := range p.order {
+		pulls := p.arms[id].Posterior.Pulls
+		if pulls < threshold && pulls < bestPulls {
+			best, bestPulls = id, pulls
+		}
+	}
+	return best, best != ""
+}
+
+// Record folds a raw reward in [0, 1] into an arm's posterior.
+func (p *Policy) Record(rng *rand.Rand, id string, reward float64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	arm, exists := p.arms[id]
+	if !exists {
+		return fmt.Errorf("thompson: unknown arm %q", id)
+	}
+	if err := arm.Posterior.Observe(rng, reward, p.config.UpdateRule); err != nil {
+		return err
+	}
+	arm.CumulativeReward += reward
+	p.totalPulls++
+
+	if p.config.Discount > 0 && p.config.Discount < 1 {
+		// Discount every arm, not only the one played: the point is that
+		// evidence ages, and an untried arm has the stalest evidence of all.
+		for _, other := range p.arms {
+			other.Posterior.Discount(p.config.Discount)
+		}
+	}
+	return nil
+}
+
+// RecordOutcome scores an outcome through the reward policy and records it.
+func (p *Policy) RecordOutcome(rng *rand.Rand, id string, outcome Outcome) error {
+	return p.Record(rng, id, p.config.Reward.Reward(outcome))
+}
+
+// Stats returns per-arm summaries, best posterior mean first.
+func (p *Policy) Stats() []ArmStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	stats := make([]ArmStats, 0, len(p.order))
+	for _, id := range p.order {
+		arm := p.arms[id]
+		mean, ok := arm.EmpiricalMean()
+		stats = append(stats, ArmStats{
+			ID:             arm.ID,
+			Alpha:          arm.Posterior.Alpha,
+			Beta:           arm.Posterior.Beta,
+			Pulls:          arm.Posterior.Pulls,
+			PosteriorMean:  arm.Posterior.Mean(),
+			EmpiricalMean:  mean,
+			HasObservation: ok,
+			CredibleWidth:  arm.Posterior.CredibleWidth(),
+			WarmStarted:    arm.WarmStarted,
+		})
+	}
+	sort.SliceStable(stats, func(i, j int) bool {
+		if stats[i].PosteriorMean != stats[j].PosteriorMean {
+			return stats[i].PosteriorMean > stats[j].PosteriorMean
+		}
+		return stats[i].ID < stats[j].ID
+	})
+	return stats
+}
+
+// BestArm returns the arm with the highest posterior mean among those with at
+// least minPulls observations.
+func (p *Policy) BestArm(minPulls uint64) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	best, bestMean := "", math.Inf(-1)
+	for _, id := range p.order {
+		arm := p.arms[id]
+		if arm.Posterior.Pulls < minPulls {
+			continue
+		}
+		if mean := arm.Posterior.Mean(); best == "" || mean > bestMean {
+			best, bestMean = id, mean
+		}
+	}
+	return best, best != ""
+}
+
+// SnapshotVersion is the current snapshot format version.
+const SnapshotVersion = 1
+
+// Snapshot is a serialisable capture of a policy's learned state.
+//
+// Note that a round trip through JSON is not bit-exact: encoders and parsers
+// can shift a float by one unit in the last place. Compare restored policies
+// with a tolerance, not with equality.
+type Snapshot struct {
+	Version    uint32 `json:"version"`
+	Arms       []Arm  `json:"arms"`
+	TotalPulls uint64 `json:"total_pulls"`
+}
+
+// Snapshot captures the policy's learned state. Configuration and sampler are
+// not included: they are strategy, not state.
+func (p *Policy) Snapshot() Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	arms := make([]Arm, 0, len(p.order))
+	for _, id := range p.order {
+		arms = append(arms, *p.arms[id])
+	}
+	return Snapshot{Version: SnapshotVersion, Arms: arms, TotalPulls: p.totalPulls}
+}
+
+// Restore rebuilds a policy from a snapshot.
+func Restore(snapshot Snapshot, config Config, sampler Sampler) (*Policy, error) {
+	if snapshot.Version != SnapshotVersion {
+		return nil, fmt.Errorf("thompson: unsupported snapshot version %d (expected %d)",
+			snapshot.Version, SnapshotVersion)
+	}
+
+	p := New(config, sampler)
+	for _, arm := range snapshot.Arms {
+		if _, err := NewPosterior(arm.Posterior.Alpha, arm.Posterior.Beta); err != nil {
+			return nil, fmt.Errorf("thompson: arm %q: %w", arm.ID, err)
+		}
+		clone := arm
+		p.arms[arm.ID] = &clone
+		p.order = append(p.order, arm.ID)
+	}
+	sort.Strings(p.order)
+	p.totalPulls = snapshot.TotalPulls
+	return p, nil
+}

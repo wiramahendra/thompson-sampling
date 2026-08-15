@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.csv
+!docs/*.csv
+.DS_Store
+
+# Cargo.lock is committed: the harness produces published numbers, and a
+# reproduction needs the same dependency versions.
