@@ -34,9 +34,9 @@ impl Outcome {
         }
     }
 
-    /// Attach a quality score, clamped to `[0, 1]`.
+    /// Attach a quality score, clamped to `[0, 1]`. NaN clamps to 0.0.
     pub fn with_quality(mut self, quality: f64) -> Self {
-        self.quality = Some(quality.clamp(0.0, 1.0));
+        self.quality = Some(clamp01(quality));
         self
     }
 
@@ -126,9 +126,29 @@ impl Default for RewardPolicy {
     }
 }
 
+/// Clamp to `[0, 1]`, mapping NaN to 0.0.
+///
+/// `f64::clamp` propagates NaN rather than clamping it, which would let one
+/// unscorable component poison the whole reward and surface as a spurious
+/// [`Error::RewardOutOfRange`](crate::Error::RewardOutOfRange) from
+/// `record_outcome` — an error about a reward the caller never supplied. The Go
+/// port clamps the same way.
+fn clamp01(value: f64) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
 /// Linear score: 1.0 at or below `target`, 0.0 at or above `max`.
+///
+/// Only NaN short-circuits, because it is unorderable and there is nothing to
+/// score. Infinities are ordered and must fall through to the comparisons
+/// below: an infinite latency is a timeout, which is the worst outcome
+/// available, not a perfect one.
 fn ramp_down(value: f64, target: f64, max: f64) -> f64 {
-    if !value.is_finite() || value <= target {
+    if value.is_nan() || value <= target {
         return 1.0;
     }
     if value >= max || max <= target {
@@ -165,7 +185,7 @@ impl RewardPolicy {
         let cost = ramp_down(outcome.cost_usd, self.target_cost_usd, self.max_cost_usd);
         let success = if outcome.success { 1.0 } else { 0.0 };
         let cache = if outcome.cache_hit { 1.0 } else { 0.0 };
-        let quality = outcome.quality.map(|q| q.clamp(0.0, 1.0));
+        let quality = outcome.quality.map(clamp01);
 
         if self.failure_is_zero && !outcome.success {
             return Breakdown {
@@ -201,7 +221,7 @@ impl RewardPolicy {
         }
 
         let total = if total_weight > 0.0 {
-            (weighted / total_weight).clamp(0.0, 1.0)
+            clamp01(weighted / total_weight)
         } else {
             success
         };
@@ -217,6 +237,10 @@ impl RewardPolicy {
     }
 
     /// Score an outcome, returning only the scalar reward.
+    ///
+    /// Always in `[0, 1]` and never NaN, whatever the outcome contains, so the
+    /// result is always a legal input to
+    /// [`Posterior::observe`](crate::Posterior::observe).
     pub fn reward(&self, outcome: &Outcome) -> f64 {
         self.evaluate(outcome).total
     }
@@ -274,6 +298,53 @@ mod tests {
         // Every present component is perfect, so the total must be 1.0 rather
         // than 0.85 (which is what scoring absent quality as zero would give).
         assert!((policy.reward(&ideal_no_quality) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_infinite_measurement_scores_worst_not_best() {
+        // Regression guard. A timeout recorded as an infinite latency, or an
+        // unmetered request recorded as an infinite cost, is the worst outcome
+        // available. Short-circuiting the ramp on `!is_finite()` scored both of
+        // them 1.0 — a perfect score — and the Go port, whose guard covers only
+        // NaN, disagreed.
+        assert_eq!(ramp_down(f64::INFINITY, 500.0, 10_000.0), 0.0);
+        assert_eq!(ramp_down(f64::NEG_INFINITY, 500.0, 10_000.0), 1.0);
+        assert_eq!(ramp_down(f64::NAN, 500.0, 10_000.0), 1.0);
+
+        let policy = RewardPolicy {
+            failure_is_zero: false,
+            ..RewardPolicy::default()
+        };
+        let breakdown = policy.evaluate(&Outcome::new(f64::INFINITY, true, f64::INFINITY));
+        assert_eq!(breakdown.latency, 0.0);
+        assert_eq!(breakdown.cost, 0.0);
+        // Success is the only component left carrying anything: 0.40 of the
+        // 0.85 weight present once quality is absent.
+        assert!(
+            (breakdown.total - 0.40 / 0.85).abs() < 1e-12,
+            "total was {}",
+            breakdown.total
+        );
+    }
+
+    #[test]
+    fn reward_is_never_nan() {
+        // `f64::clamp` propagates NaN instead of clamping it, so a single
+        // unscorable component used to make the whole reward NaN, which
+        // `record_outcome` then rejected as out of range.
+        let policy = RewardPolicy::default();
+        let cases = [
+            Outcome::new(320.0, true, 0.0012).with_quality(f64::NAN),
+            Outcome::new(f64::NAN, true, f64::NAN).with_quality(f64::NAN),
+            Outcome::new(f64::INFINITY, true, f64::INFINITY),
+        ];
+        for c in cases {
+            let r = policy.reward(&c);
+            assert!(
+                !r.is_nan() && (0.0..=1.0).contains(&r),
+                "reward {r} for {c:?}"
+            );
+        }
     }
 
     #[test]
