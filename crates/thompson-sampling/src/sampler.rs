@@ -381,6 +381,45 @@ mod tests {
         }
     }
 
+    /// Closed-form raw moment of a Beta: `E[X^k] = prod_{i<k} (a+i)/(a+b+i)`.
+    fn beta_raw_moment(alpha: f64, beta: f64, k: u32) -> f64 {
+        (0..k)
+            .map(|i| (alpha + i as f64) / (alpha + beta + i as f64))
+            .product()
+    }
+
+    #[test]
+    fn exact_matches_beta_moments_to_fourth_order() {
+        // The first two moments do not pin down a shape, and shape is the whole
+        // subject of this crate: `MeanPlusGaussian` matches mean and variance by
+        // construction and is still wrong. Raw moments through the fourth
+        // constrain skew and kurtosis as well, and need no special functions.
+        for (a, b) in [(1.0, 1.0), (2.0, 8.0), (30.0, 5.0), (0.5, 0.5)] {
+            let mut rng = SmallRng::seed_from_u64(0xD15EA5E);
+            let p = Posterior::new(a, b).unwrap();
+            let n = 200_000;
+            let mut sums = [0.0_f64; 4];
+            for _ in 0..n {
+                let s = Exact.sample(&mut rng, &p);
+                let mut power = 1.0;
+                for sum in sums.iter_mut() {
+                    power *= s;
+                    *sum += power;
+                }
+            }
+            for (idx, sum) in sums.iter().enumerate() {
+                let k = idx as u32 + 1;
+                let observed = sum / n as f64;
+                let expected = beta_raw_moment(a, b, k);
+                let relative = (observed - expected).abs() / expected;
+                assert!(
+                    relative < 0.02,
+                    "Beta({a},{b}) raw moment {k}: {observed} != {expected} (relative {relative})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn exact_explores_a_flat_posterior_uniformly() {
         // Beta(1,1) is uniform. Roughly a tenth of draws should land in each
