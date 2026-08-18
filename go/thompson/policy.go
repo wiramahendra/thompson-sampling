@@ -145,7 +145,7 @@ func (p *Policy) AddArm(id string) (InformedPrior, bool) {
 	if _, exists := p.arms[id]; exists {
 		return InformedPrior{}, false
 	}
-	prior := priorFor(p.config.WarmStart, id, p.arms)
+	prior := priorFor(p.config.WarmStart, id, p.order, p.arms)
 	p.insertLocked(id, prior)
 	return prior, true
 }
@@ -417,6 +417,12 @@ func Restore(snapshot Snapshot, config Config, sampler Sampler) (*Policy, error)
 	for _, arm := range snapshot.Arms {
 		if _, err := NewPosterior(arm.Posterior.Alpha, arm.Posterior.Beta); err != nil {
 			return nil, fmt.Errorf("thompson: arm %q: %w", arm.ID, err)
+		}
+		// A snapshot is deserialised input, so it can name the same arm twice.
+		// Accepting that would put the ID in order twice against one map entry,
+		// and the arm would then be sampled twice in every selection.
+		if _, dup := p.arms[arm.ID]; dup {
+			return nil, fmt.Errorf("thompson: snapshot names arm %q twice", arm.ID)
 		}
 		clone := arm
 		p.arms[arm.ID] = &clone
