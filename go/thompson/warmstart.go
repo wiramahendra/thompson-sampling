@@ -111,7 +111,13 @@ func ModelFamily(model string) string {
 }
 
 // priorFor chooses a prior for newID given the arms already present.
-func priorFor(ws WarmStart, newID string, existing map[string]*Arm) InformedPrior {
+//
+// order must be the policy's sorted arm IDs. Ranging over the map instead would
+// make the choice depend on Go's randomised map iteration order whenever two
+// candidates have the same posterior mean — the comparison below is strict, so
+// whichever is visited first keeps the slot — and a new arm's prior strength
+// would then vary between runs of the same program.
+func priorFor(ws WarmStart, newID string, order []string, existing map[string]*Arm) InformedPrior {
 	switch ws.Kind {
 	case ColdStart:
 		return NewInformedPrior(1, 1)
@@ -122,10 +128,11 @@ func priorFor(ws WarmStart, newID string, existing map[string]*Arm) InformedPrio
 	target := ParseModelID(newID)
 	var bestFamily, bestProvider *Arm
 
-	for id, arm := range existing {
+	for _, id := range order {
+		arm, ok := existing[id]
 		// An arm with no observations carries no information to lend, and
 		// chaining warm starts would let one guess propagate through the set.
-		if arm.Posterior.Pulls == 0 || id == newID {
+		if !ok || arm.Posterior.Pulls == 0 || id == newID {
 			continue
 		}
 		candidate := ParseModelID(id)
