@@ -280,6 +280,33 @@ func TestWarmStartInheritsFromSameFamily(t *testing.T) {
 	}
 }
 
+func TestWarmStartTieBreakIsDeterministic(t *testing.T) {
+	// Regression guard. Two candidate neighbours with identical posterior means
+	// but different evidence weight: the "best mean" comparison is strict, so
+	// whichever is visited first lends its prior. priorFor used to range over
+	// the arm map, which Go deliberately randomises, so the new arm's prior
+	// alternated between Beta(1,1) and Beta(10,10) across runs of this test.
+	seen := map[InformedPrior]int{}
+	for i := 0; i < 200; i++ {
+		p := NewDefault()
+		p.AddArmWithPrior("openai/gpt-4-a", InformedPrior{Alpha: 5, Beta: 5})
+		p.AddArmWithPrior("openai/gpt-4-b", InformedPrior{Alpha: 50, Beta: 50})
+		// Both means are exactly 0.5. Set Pulls directly rather than recording,
+		// so the tie survives and only the ordering decides the winner.
+		p.arms["openai/gpt-4-a"].Posterior.Pulls = 8
+		p.arms["openai/gpt-4-b"].Posterior.Pulls = 98
+
+		prior, added := p.AddArm("openai/gpt-4.5-turbo")
+		if !added {
+			t.Fatal("arm should be new")
+		}
+		seen[prior]++
+	}
+	if len(seen) != 1 {
+		t.Errorf("prior depends on map iteration order: %v", seen)
+	}
+}
+
 func TestWarmStartDoesNotInheritFromUnpulledArm(t *testing.T) {
 	// A warm-started arm has a concentrated posterior and zero pulls. Letting
 	// it seed the next arm would launder a guess into evidence.
@@ -501,6 +528,51 @@ func TestRestoreRejectsBadInput(t *testing.T) {
 	corrupt.Arms[0].Posterior.Alpha = 0
 	if _, err := Restore(corrupt, DefaultConfig(), ExactSampler{}); err == nil {
 		t.Error("expected a posterior validation error")
+	}
+
+	// A duplicated ID would land in order twice against one map entry, so the
+	// arm would be sampled twice in every selection.
+	duplicated := p.Snapshot()
+	duplicated.Arms = append(duplicated.Arms, duplicated.Arms[0])
+	if _, err := Restore(duplicated, DefaultConfig(), ExactSampler{}); err == nil {
+		t.Error("expected a duplicate-arm error")
+	}
+}
+
+func TestRewardScoresAnInfiniteMeasurementAsWorst(t *testing.T) {
+	// A timeout recorded as an infinite latency is the worst outcome available,
+	// not a perfect one. This is where the Rust port disagreed: its ramp
+	// short-circuited on !is_finite(), which swept +Inf in with NaN.
+	if got := rampDown(math.Inf(1), 500, 10000); got != 0 {
+		t.Errorf("rampDown(+Inf) = %v, want 0", got)
+	}
+	if got := rampDown(math.Inf(-1), 500, 10000); got != 1 {
+		t.Errorf("rampDown(-Inf) = %v, want 1", got)
+	}
+	if got := rampDown(math.NaN(), 500, 10000); got != 1 {
+		t.Errorf("rampDown(NaN) = %v, want 1", got)
+	}
+
+	rp := DefaultRewardPolicy()
+	rp.FailureIsZero = false
+	// Success is the only component left carrying anything: 0.40 of the 0.85
+	// weight present once quality is absent.
+	got := rp.Reward(NewOutcome(math.Inf(1), true, math.Inf(1)))
+	if math.Abs(got-0.40/0.85) > 1e-12 {
+		t.Errorf("Reward = %v, want %v", got, 0.40/0.85)
+	}
+}
+
+func TestRewardIsNeverNaN(t *testing.T) {
+	rp := DefaultRewardPolicy()
+	for _, o := range []Outcome{
+		NewOutcome(320, true, 0.0012).WithQuality(math.NaN()),
+		NewOutcome(math.NaN(), true, math.NaN()).WithQuality(math.NaN()),
+		NewOutcome(math.Inf(1), true, math.Inf(1)),
+	} {
+		if r := rp.Reward(o); math.IsNaN(r) || r < 0 || r > 1 {
+			t.Errorf("Reward(%+v) = %v", o, r)
+		}
 	}
 }
 
