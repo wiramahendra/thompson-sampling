@@ -349,6 +349,12 @@ impl ThompsonSampling {
         let mut arms = BTreeMap::new();
         for arm in snapshot.arms {
             Posterior::new(arm.posterior.alpha, arm.posterior.beta)?;
+            // A snapshot is deserialised input, so it can name the same arm
+            // twice. Inserting silently would drop one of the two histories;
+            // rejecting says which arm was ambiguous.
+            if arms.contains_key(&arm.id) {
+                return Err(Error::Decode(format!("duplicate arm id: {}", arm.id)));
+            }
             arms.insert(arm.id.clone(), arm);
         }
 
@@ -441,6 +447,24 @@ mod tests {
             }
         );
         assert_eq!(policy.total_pulls(), 0);
+    }
+
+    #[test]
+    fn record_outcome_survives_unscorable_measurements() {
+        // A judge that returns NaN and a request that times out are both things
+        // a caller will hand over eventually. Neither is a malformed reward, so
+        // neither should come back as `RewardOutOfRange` — an error naming a
+        // reward the caller never supplied.
+        let mut policy = ThompsonSampling::with_defaults(["a"]);
+        let mut rng = rng();
+
+        let unscored = Outcome::new(320.0, true, 0.0012).with_quality(f64::NAN);
+        policy.record_outcome(&mut rng, "a", &unscored).unwrap();
+
+        let timed_out = Outcome::new(f64::INFINITY, true, f64::INFINITY);
+        policy.record_outcome(&mut rng, "a", &timed_out).unwrap();
+
+        assert_eq!(policy.arm("a").unwrap().pulls(), 2);
     }
 
     #[test]
@@ -795,6 +819,15 @@ mod tests {
         let policy = ThompsonSampling::with_defaults(["a"]);
         let mut snapshot = policy.snapshot();
         snapshot.arms[0].posterior.alpha = 0.0;
+        assert!(ThompsonSampling::restore(snapshot, Box::new(Exact)).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_a_duplicated_arm() {
+        let policy = ThompsonSampling::with_defaults(["a"]);
+        let mut snapshot = policy.snapshot();
+        let duplicate = snapshot.arms[0].clone();
+        snapshot.arms.push(duplicate);
         assert!(ThompsonSampling::restore(snapshot, Box::new(Exact)).is_err());
     }
 
