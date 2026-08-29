@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use thompson_sampling::observer::PolicyObserver;
 use thompson_sampling::posterior::Posterior;
-use thompson_sampling::{ThompsonSampling, Outcome};
+use thompson_sampling::{SnapshotStore, ThompsonSampling, Outcome};
 
 #[derive(Debug, Default)]
 struct LoggingObserver;
