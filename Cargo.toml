@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/thompson-sampling", "crates/thompson-sim"]
+members = ["crates/thompson-sampling", "crates/thompson-sim", "crates/control-plane"]
 
 [workspace.package]
 version = "0.1.0"
