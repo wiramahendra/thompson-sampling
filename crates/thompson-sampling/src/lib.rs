@@ -50,6 +50,7 @@
 pub mod arm;
 pub mod context;
 pub mod discount;
+pub mod health;
 pub mod error;
 pub mod observer;
 pub mod persistence;
