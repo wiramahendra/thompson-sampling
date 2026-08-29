@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 thompson-sampling = { path = "../thompson-sampling" }
 rand = { workspace = true, features = ["small_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lib]
 name = "thompson_sim"
