@@ -112,6 +112,7 @@ type Policy struct {
 	config     Config
 	sampler    Sampler
 	totalPulls uint64
+	observer   Observer
 }
 
 // New creates an empty policy.
@@ -164,13 +165,39 @@ func (p *Policy) AddArmWithPrior(id string, prior InformedPrior) bool {
 }
 
 func (p *Policy) insertLocked(id string, prior InformedPrior) {
+	warmStarted := prior != NewInformedPrior(1, 1)
 	p.arms[id] = &Arm{
 		ID:          id,
 		Posterior:   prior.Posterior(),
-		WarmStarted: prior != NewInformedPrior(1, 1),
+		WarmStarted: warmStarted,
 	}
 	p.order = append(p.order, id)
 	sort.Strings(p.order)
+	if p.observer != nil {
+		p.observer.OnArmAdded(id, warmStarted)
+	}
+}
+
+// SetObserver attaches an observer for metrics/logging. Nil clears it.
+func (p *Policy) SetObserver(obs Observer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.observer = obs
+}
+
+// DiscountPolicy returns the current discount as a first-class policy.
+func (p *Policy) DiscountPolicy() FixedDiscount {
+	return NewFixedDiscount(p.config.Discount)
+}
+
+// EffectiveMemory returns 1/(1-factor) or Inf when stationary.
+func (p *Policy) EffectiveMemory() float64 {
+	return p.DiscountPolicy().EffectiveMemory()
+}
+
+// SaveToStore persists via a SnapshotStore.
+func (p *Policy) SaveToStore(store SnapshotStore) error {
+	return store.Save(p.Snapshot())
 }
 
 // RemoveArm removes an arm, reporting whether it was present.
@@ -229,26 +256,64 @@ func (p *Policy) Select(rng *rand.Rand) (string, error) {
 		return "", ErrNoArms
 	}
 
+	var chosen string
 	switch p.config.Selection.Kind {
 	case UCBRegularized:
-		return p.argmaxUCBLocked(rng), nil
-
+		chosen = p.argmaxUCBLocked(rng)
 	case PhasedSelection:
-		// Both thresholds gate the same thing, so the binding one is the
-		// larger. Exploiting only among arms past the threshold is a trap: the
-		// first arm to cross becomes the only eligible one, wins every
-		// subsequent round, and the arms behind it never advance.
 		quota := p.config.Selection.Bootstrap
 		if p.config.Selection.MinPullsForExploit > quota {
 			quota = p.config.Selection.MinPullsForExploit
 		}
 		if id, ok := p.leastPulledBelowLocked(quota); ok {
-			return id, nil
+			chosen = id
+		} else {
+			chosen = p.argmaxSampledLocked(rng)
 		}
-		return p.argmaxSampledLocked(rng), nil
-
 	default:
-		return p.argmaxSampledLocked(rng), nil
+		chosen = p.argmaxSampledLocked(rng)
+	}
+
+	if p.observer != nil {
+		scores := make(map[string]float64, len(p.order))
+		for _, id := range p.order {
+			scores[id] = p.arms[id].Posterior.Mean()
+		}
+		p.observer.OnSelect(chosen, scores)
+	}
+
+	return chosen, nil
+}
+
+// SelectWith chooses an arm using a custom SelectionStrategy, bypassing
+// config.Selection. This is the first-class extension point for selection.
+func (p *Policy) SelectWith(rng *rand.Rand, strategy SelectionStrategy) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.arms) == 0 {
+		return "", ErrNoArms
+	}
+	chosen := strategy.Select(rng, p.arms, p.order, p.sampler, p.totalPulls)
+	if p.observer != nil {
+		scores := make(map[string]float64, len(p.order))
+		for _, id := range p.order {
+			scores[id] = p.arms[id].Posterior.Mean()
+		}
+		p.observer.OnSelect(chosen, scores)
+	}
+	return chosen, nil
+}
+
+// SelectionStrategyFromConfig returns a strategy matching config.Selection.
+func (p *Policy) SelectionStrategyFromConfig() SelectionStrategy {
+	switch p.config.Selection.Kind {
+	case UCBRegularized:
+		return UCBRegularizedStrategy{C: p.config.Selection.C, UntilPulls: p.config.Selection.UntilPulls}
+	case PhasedSelection:
+		return PhasedStrategy{Bootstrap: p.config.Selection.Bootstrap, MinPullsForExploit: p.config.Selection.MinPullsForExploit}
+	default:
+		return ThompsonStrategy{}
 	}
 }
 
@@ -313,16 +378,34 @@ func (p *Policy) Record(rng *rand.Rand, id string, reward float64) error {
 		return err
 	}
 	arm.CumulativeReward += reward
+	posteriorSnap := arm.Posterior
 	p.totalPulls++
 
-	if p.config.Discount > 0 && p.config.Discount < 1 {
-		// Discount every arm, not only the one played: the point is that
-		// evidence ages, and an untried arm has the stalest evidence of all.
+	discount := NewFixedDiscount(p.config.Discount)
+	if factor := discount.Factor(); factor > 0 {
 		for _, other := range p.arms {
-			other.Posterior.Discount(p.config.Discount)
+			other.Posterior.Discount(factor)
+		}
+		if p.observer != nil {
+			p.observer.OnDiscount(factor)
 		}
 	}
+	if p.observer != nil {
+		p.observer.OnRecord(id, reward, posteriorSnap)
+	}
 	return nil
+}
+
+// RestoreFromStore rebuilds a policy from a SnapshotStore.
+func RestoreFromStore(store SnapshotStore, config Config, sampler Sampler) (*Policy, error) {
+	snap, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	if snap == nil {
+		return nil, nil
+	}
+	return Restore(*snap, config, sampler)
 }
 
 // RecordOutcome scores an outcome through the reward policy and records it.
