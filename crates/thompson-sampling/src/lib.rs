@@ -48,6 +48,7 @@
 #![warn(missing_docs)]
 
 pub mod arm;
+pub mod context;
 pub mod discount;
 pub mod error;
 pub mod observer;
