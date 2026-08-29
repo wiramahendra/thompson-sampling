@@ -11,4 +11,5 @@
 
 pub mod env;
 pub mod experiment;
+pub mod trace;
 pub mod treatments;
