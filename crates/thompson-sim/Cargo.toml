@@ -12,6 +12,10 @@ repository.workspace = true
 thompson-sampling = { path = "../thompson-sampling" }
 rand = { workspace = true, features = ["small_rng"] }
 
+[lib]
+name = "thompson_sim"
+path = "src/lib.rs"
+
 [[bin]]
 name = "thompson-sim"
 path = "src/main.rs"
