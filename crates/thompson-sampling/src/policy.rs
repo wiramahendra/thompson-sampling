@@ -1,10 +1,13 @@
 //! The bandit policy: arm registry, selection strategy, and updates.
 
 use crate::arm::{Arm, ArmStats};
+use crate::discount::{DiscountPolicy, FixedDiscount};
 use crate::error::{Error, Result};
+use crate::observer::PolicyObserver;
 use crate::posterior::{Posterior, UpdateRule};
 use crate::reward::{Outcome, RewardPolicy};
 use crate::sampler::{BetaSampler, Exact};
+use crate::selection::{PhasedStrategy, SelectionStrategy, ThompsonStrategy, UcbRegularizedStrategy};
 use crate::warm_start::{prior_for, InformedPrior, WarmStart};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -75,12 +78,24 @@ pub struct Config {
 /// run is reproducible from its seed. This matters more than it looks: with a
 /// hash map, iteration order supplies incidental randomness that can mask a
 /// sampler doing no exploration of its own.
-#[derive(Debug)]
 pub struct ThompsonSampling {
     arms: BTreeMap<String, Arm>,
     config: Config,
     sampler: Box<dyn BetaSampler>,
     total_pulls: u64,
+    observer: Option<Box<dyn PolicyObserver>>,
+}
+
+impl std::fmt::Debug for ThompsonSampling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThompsonSampling")
+            .field("arms", &self.arms)
+            .field("config", &self.config)
+            .field("sampler", &self.sampler)
+            .field("total_pulls", &self.total_pulls)
+            .field("observer", &self.observer.as_ref().map(|_| "<observer>"))
+            .finish()
+    }
 }
 
 impl ThompsonSampling {
@@ -91,7 +106,34 @@ impl ThompsonSampling {
             config,
             sampler,
             total_pulls: 0,
+            observer: None,
         }
+    }
+
+    /// Attach an observer for metrics/logging. Replaces any existing observer.
+    pub fn set_observer(&mut self, observer: Box<dyn PolicyObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Builder-style observer attachment.
+    pub fn with_observer(mut self, observer: Box<dyn PolicyObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Remove any attached observer.
+    pub fn clear_observer(&mut self) {
+        self.observer = None;
+    }
+
+    /// Current discount as a first-class policy. Wraps `config.discount`.
+    pub fn discount_policy(&self) -> FixedDiscount {
+        FixedDiscount::new(self.config.discount)
+    }
+
+    /// Effective memory in observations implied by the current discount.
+    pub fn effective_memory(&self) -> f64 {
+        self.discount_policy().effective_memory()
     }
 
     /// Create a policy with default configuration and the exact sampler.
@@ -133,7 +175,11 @@ impl ThompsonSampling {
     fn insert(&mut self, id: String, prior: InformedPrior) {
         let mut arm = Arm::new(id.clone(), prior.to_posterior());
         arm.warm_started = prior != InformedPrior::new(1.0, 1.0);
-        self.arms.insert(id, arm);
+        let warm_started = arm.warm_started;
+        self.arms.insert(id.clone(), arm);
+        if let Some(obs) = &self.observer {
+            obs.on_arm_added(&id, warm_started);
+        }
     }
 
     /// Remove an arm, returning it if it was present.
@@ -187,28 +233,85 @@ impl ThompsonSampling {
             return Err(Error::NoArms);
         }
 
-        match self.config.selection {
-            Selection::Thompson => Ok(self.argmax_sampled(rng, |_| true)),
-            Selection::UcbRegularized { c, until_pulls } => {
-                Ok(self.argmax_ucb(rng, c, until_pulls))
-            }
+        let chosen = match self.config.selection {
+            Selection::Thompson => self.argmax_sampled(rng, |_| true),
+            Selection::UcbRegularized { c, until_pulls } => self.argmax_ucb(rng, c, until_pulls),
             Selection::Phased {
                 bootstrap,
                 min_pulls_for_exploit,
             } => {
-                // Both thresholds gate the same thing, so the binding one is
-                // the larger. Treating them independently — exploit among arms
-                // past the threshold, ignore the rest — is a trap: the first
-                // arm to cross becomes the only eligible arm, wins every
-                // subsequent round, and the arms behind it never advance. The
-                // policy then locks onto whichever arm happened to cross first,
-                // which is not the same as whichever arm is best.
                 let forced = bootstrap.max(min_pulls_for_exploit);
                 if let Some(id) = self.least_pulled_below(forced) {
-                    return Ok(id);
+                    id
+                } else {
+                    self.argmax_sampled(rng, |_| true)
                 }
-                Ok(self.argmax_sampled(rng, |_| true))
             }
+        };
+
+        // Best-effort observability: re-sample scores for the observer without
+        // affecting the decision (the decision already used the sampler's draw).
+        // For exact reproducibility the observer sees the same chosen arm but
+        // fresh draws for candidates — document this if you need bit-identical
+        // replay, use `select_with` with a deterministic sampler.
+        if let Some(obs) = &self.observer {
+            // Collect current sampler scores for observability (cheap, not on
+            // critical path in production if observer is None).
+            let mut scores: Vec<(&str, f64)> = Vec::new();
+            // We cannot re-use the exact draws that decided `chosen` without
+            // threading them through; for observability a second draw is fine.
+            // If you need exact draws, implement `SelectionStrategy` and hook
+            // there.
+            for arm in self.arms.values() {
+                // Use posterior mean as stable proxy when observer is attached;
+                // avoids double RNG consumption on hot path.
+                scores.push((arm.id.as_str(), arm.posterior.mean()));
+            }
+            obs.on_select(&chosen, &scores);
+        }
+
+        Ok(chosen)
+    }
+
+    /// Choose an arm using a custom [`SelectionStrategy`], bypassing
+    /// `config.selection`. This is the first-class extension point for
+    /// selection: implement the trait out-of-tree and pass it here without
+    /// forking `policy.rs`.
+    pub fn select_with(
+        &self,
+        rng: &mut dyn RngCore,
+        strategy: &dyn SelectionStrategy,
+    ) -> Result<String> {
+        if self.arms.is_empty() {
+            return Err(Error::NoArms);
+        }
+        let chosen = strategy.select(rng, &self.arms, self.sampler.as_ref(), self.total_pulls);
+        if let Some(obs) = &self.observer {
+            let scores: Vec<(&str, f64)> = self
+                .arms
+                .values()
+                .map(|a| (a.id.as_str(), a.posterior.mean()))
+                .collect();
+            obs.on_select(&chosen, &scores);
+        }
+        Ok(chosen)
+    }
+
+    /// Convenience: build a strategy from `config.selection` as a trait object.
+    pub fn selection_strategy(&self) -> Box<dyn SelectionStrategy> {
+        match self.config.selection {
+            Selection::Thompson => Box::new(ThompsonStrategy),
+            Selection::UcbRegularized { c, until_pulls } => Box::new(UcbRegularizedStrategy {
+                c,
+                until_pulls,
+            }),
+            Selection::Phased {
+                bootstrap,
+                min_pulls_for_exploit,
+            } => Box::new(PhasedStrategy {
+                bootstrap,
+                min_pulls_for_exploit,
+            }),
         }
     }
 
@@ -264,22 +367,36 @@ impl ThompsonSampling {
     pub fn record(&mut self, rng: &mut dyn RngCore, id: &str, reward: f64) -> Result<()> {
         let rule = self.config.update_rule;
 
-        let arm = self
-            .arms
-            .get_mut(id)
-            .ok_or_else(|| Error::UnknownArm { id: id.to_string() })?;
-        arm.posterior.observe(rng, reward, rule)?;
-        arm.cumulative_reward += reward;
+        // Borrow observer first to avoid borrow conflict with arms.
+        let discount = FixedDiscount::new(self.config.discount);
+
+        let posterior_snapshot: Posterior;
+        {
+            let arm = self
+                .arms
+                .get_mut(id)
+                .ok_or_else(|| Error::UnknownArm { id: id.to_string() })?;
+            arm.posterior.observe(rng, reward, rule)?;
+            arm.cumulative_reward += reward;
+            posterior_snapshot = arm.posterior;
+        }
 
         self.total_pulls += 1;
 
-        if let Some(factor) = self.config.discount {
+        if let Some(factor) = discount.factor() {
             // Discount every arm, not only the one played: the point is that
             // evidence ages, and an arm that has not been tried lately has the
             // stalest evidence of all.
             for arm in self.arms.values_mut() {
-                arm.posterior.discount(factor);
+                discount.apply(&mut arm.posterior);
             }
+            if let Some(obs) = &self.observer {
+                obs.on_discount(factor);
+            }
+        }
+
+        if let Some(obs) = &self.observer {
+            obs.on_record(id, reward, &posterior_snapshot);
         }
 
         Ok(())
@@ -363,7 +480,27 @@ impl ThompsonSampling {
             config: snapshot.config,
             sampler,
             total_pulls: snapshot.total_pulls,
+            observer: None,
         })
+    }
+
+    /// Persist via a [`SnapshotStore`](crate::persistence::SnapshotStore).
+    pub fn save_to_store(
+        &self,
+        store: &dyn crate::persistence::SnapshotStore,
+    ) -> crate::error::Result<()> {
+        store.save(&self.snapshot())
+    }
+
+    /// Restore via a store, with an explicit sampler.
+    pub fn restore_from_store(
+        store: &dyn crate::persistence::SnapshotStore,
+        sampler: Box<dyn BetaSampler>,
+    ) -> crate::error::Result<Option<Self>> {
+        match store.load()? {
+            None => Ok(None),
+            Some(snapshot) => Ok(Some(Self::restore(snapshot, sampler)?)),
+        }
     }
 }
 
