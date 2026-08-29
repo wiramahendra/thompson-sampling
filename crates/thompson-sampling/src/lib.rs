@@ -48,17 +48,25 @@
 #![warn(missing_docs)]
 
 pub mod arm;
+pub mod discount;
 pub mod error;
+pub mod observer;
+pub mod persistence;
 pub mod policy;
 pub mod posterior;
 pub mod reward;
 pub mod sampler;
+pub mod selection;
 pub mod warm_start;
 
 pub use arm::{Arm, ArmStats};
+pub use discount::{DiscountPolicy, FixedDiscount};
 pub use error::{Error, Result};
+pub use observer::{Event, NoopObserver, PolicyObserver};
+pub use persistence::{FileStore, MemoryStore, SnapshotStore};
 pub use policy::{Config, Selection, Snapshot, ThompsonSampling};
 pub use posterior::{Posterior, UpdateRule};
 pub use reward::{Breakdown, Outcome, RewardPolicy, Weights};
 pub use sampler::{BetaSampler, Exact};
+pub use selection::{PhasedStrategy, SelectionStrategy, ThompsonStrategy, UcbRegularizedStrategy};
 pub use warm_start::{InformedPrior, WarmStart};
