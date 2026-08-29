@@ -173,6 +173,8 @@ name = "thompson-sim"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "serde",
+ "serde_json",
  "thompson-sampling",
 ]
 
