@@ -1,6 +1,9 @@
-# Thompson Wire Protocol — v1 Freeze Prep
+# Thompson Wire Protocol — v1
 
-Status: draft — thin waist not yet frozen. Validates via `thompson-sim` + `go/harness` before spec lock.
+Status: **frozen** `v1` — thin waist `select`/`record` + `Snapshot{version:1}` locked.
+Validates via `thompson-sim` `trace-replay` + `go/harness` `k6` before SaaS cut.
+
+Freeze gate passed: `hard`/`churn` 2.4–14× `FINDINGS.md:43`, `binarize 187×` `FINDINGS.md:114`, `drift 0.999` 5.9× `FINDINGS.md:206` reproduced on `traces/*.jsonl` `trace.rs:1` + `k6` `load/k6.js` p95 `health<100ms` `snapshots<200ms`.
 
 ## Thin Waist (2 calls)
 
