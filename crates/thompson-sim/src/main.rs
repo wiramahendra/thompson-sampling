@@ -6,10 +6,10 @@
 //! cargo run --release -p thompson-sim -- --csv results.csv
 //! ```
 
+use std::fmt::Write as _;
 use thompson_sim::env;
 use thompson_sim::experiment::{evaluate, Summary};
 use thompson_sim::treatments;
-use std::fmt::Write as _;
 
 struct Args {
     seeds: usize,
