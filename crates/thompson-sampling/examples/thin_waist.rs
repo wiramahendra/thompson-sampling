@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use thompson_sampling::observer::PolicyObserver;
 use thompson_sampling::posterior::Posterior;
-use thompson_sampling::{SnapshotStore, ThompsonSampling, Outcome};
+use thompson_sampling::{Outcome, SnapshotStore, ThompsonSampling};
 
 #[derive(Debug, Default)]
 struct LoggingObserver;
@@ -20,7 +20,10 @@ impl PolicyObserver for LoggingObserver {
         eprintln!("select -> {chosen} scores={scores:?}");
     }
     fn on_record(&self, arm: &str, reward: f64, posterior: &Posterior) {
-        eprintln!("record {arm} reward={reward:.3} posterior mean={:.3}", posterior.mean());
+        eprintln!(
+            "record {arm} reward={reward:.3} posterior mean={:.3}",
+            posterior.mean()
+        );
     }
     fn on_arm_added(&self, id: &str, warm_started: bool) {
         eprintln!("arm added {id} warm_started={warm_started}");
@@ -52,7 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = thompson_sampling::MemoryStore::new();
     policy.save_to_store(&store)?;
     let snapshot = store.load()?.unwrap();
-    println!("snapshot version {} with {} arms", snapshot.version, snapshot.arms.len());
+    println!(
+        "snapshot version {} with {} arms",
+        snapshot.version,
+        snapshot.arms.len()
+    );
 
     // Discount introspection
     println!("effective_memory: {}", policy.effective_memory());
