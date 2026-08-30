@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Thompson Wire v1",
+  "description": "Wire types for Snapshot/Outcome/Config — frozen after trace replay gate",
+  "type": "object",
+  "properties": {
+    "version": { "type": "integer", "const": 1, "description": "Snapshot::VERSION policy.rs:511" },
+    "config": {
+      "type": "object",
+      "properties": {
+        "update_rule": { "enum": ["binarize", "bernoulli", "fractional"], "description": "posterior.rs:19 UpdateRule" },
+        "reward_policy": { "type": "object", "description": "reward.rs:97 RewardPolicy" },
+        "warm_start": { "type": "object", "description": "warm_start.rs:81 FamilySimilarity" },
+        "selection": { "enum": ["thompson", "ucb_regularized", "phased"], "description": "policy.rs:16 Selection" },
+        "discount": { "type": ["number", "null"], "description": "policy.rs:70 Option<f64>, FixedDiscount discount.rs:17" }
+      }
+    },
+    "arms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "provider/model e.g. openai/gpt-4" },
+          "posterior": {
+            "type": "object",
+            "properties": {
+              "alpha": { "type": "number", "minimum": 0.0001 },
+              "beta": { "type": "number", "minimum": 0.0001 },
+              "pulls": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["alpha", "beta", "pulls"]
+          },
+          "warm_started": { "type": "boolean" }
+        },
+        "required": ["id", "posterior"]
+      }
+    },
+    "total_pulls": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["version", "arms", "total_pulls"]
+}
