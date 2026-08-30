@@ -38,7 +38,11 @@ impl TenantDashboard {
                 warm_started: a.warm_started,
             })
             .collect();
-        arms.sort_by(|a, b| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal));
+        arms.sort_by(|a, b| {
+            b.mean
+                .partial_cmp(&a.mean)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Self {
             tenant: tenant.to_string(),
             total_pulls: snap.total_pulls,
