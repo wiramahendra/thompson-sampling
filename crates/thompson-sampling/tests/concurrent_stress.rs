@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use thompson_sampling::health::CircuitBreaker;
 use thompson_sampling::observer::PolicyObserver;
 use thompson_sampling::posterior::Posterior;
-use thompson_sampling::{Config, ThompsonSampling};
+use thompson_sampling::ThompsonSampling;
 
 #[derive(Debug, Default)]
 struct CountingObserver {
