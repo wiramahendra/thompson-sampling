@@ -51,6 +51,7 @@ pub mod arm;
 pub mod context;
 pub mod discount;
 pub mod health;
+pub mod linear;
 pub mod otel;
 pub mod error;
 pub mod observer;
