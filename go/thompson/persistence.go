@@ -2,7 +2,9 @@ package thompson
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // SnapshotStore persists policy snapshots durably.
@@ -50,11 +52,36 @@ func (f *FileStore) Save(s Snapshot) error {
 	if err != nil {
 		return err
 	}
+	if len(b) > 10*1024*1024 {
+		return fmt.Errorf("thompson: snapshot too large (%d bytes)", len(b))
+	}
 	tmp := f.Path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	// Use non-cached write with fsync for durability
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, f.Path)
+	if _, err := file.Write(b); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return err
+	}
+	file.Close()
+	if err := os.Rename(tmp, f.Path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// Best-effort fsync parent directory
+	if dir, err := os.Open(filepath.Dir(f.Path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+	return nil
 }
 
 func (f *FileStore) Load() (*Snapshot, error) {
@@ -64,6 +91,9 @@ func (f *FileStore) Load() (*Snapshot, error) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if len(b) > 10*1024*1024 {
+		return nil, fmt.Errorf("thompson: snapshot too large (%d bytes)", len(b))
 	}
 	var s Snapshot
 	if err := json.Unmarshal(b, &s); err != nil {
