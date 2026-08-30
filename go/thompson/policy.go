@@ -257,9 +257,17 @@ func (p *Policy) Select(rng *rand.Rand) (string, error) {
 	}
 
 	var chosen string
+	var scores map[string]float64
+	if p.observer != nil {
+		scores = make(map[string]float64, len(p.order))
+	}
 	switch p.config.Selection.Kind {
 	case UCBRegularized:
-		chosen = p.argmaxUCBLocked(rng)
+		if p.observer != nil {
+			chosen, scores = p.argmaxUCBWithScoresLocked(rng, scores)
+		} else {
+			chosen = p.argmaxUCBLocked(rng)
+		}
 	case PhasedSelection:
 		quota := p.config.Selection.Bootstrap
 		if p.config.Selection.MinPullsForExploit > quota {
@@ -267,18 +275,27 @@ func (p *Policy) Select(rng *rand.Rand) (string, error) {
 		}
 		if id, ok := p.leastPulledBelowLocked(quota); ok {
 			chosen = id
+			if p.observer != nil {
+				for _, pid := range p.order {
+					scores[pid] = p.arms[pid].Posterior.Mean()
+				}
+			}
+		} else {
+			if p.observer != nil {
+				chosen, scores = p.argmaxSampledWithScoresLocked(rng, scores)
+			} else {
+				chosen = p.argmaxSampledLocked(rng)
+			}
+		}
+	default:
+		if p.observer != nil {
+			chosen, scores = p.argmaxSampledWithScoresLocked(rng, scores)
 		} else {
 			chosen = p.argmaxSampledLocked(rng)
 		}
-	default:
-		chosen = p.argmaxSampledLocked(rng)
 	}
 
 	if p.observer != nil {
-		scores := make(map[string]float64, len(p.order))
-		for _, id := range p.order {
-			scores[id] = p.arms[id].Posterior.Mean()
-		}
 		p.observer.OnSelect(chosen, scores)
 	}
 
@@ -326,6 +343,42 @@ func (p *Policy) argmaxSampledLocked(rng *rand.Rand) string {
 		}
 	}
 	return best
+}
+
+func (p *Policy) argmaxSampledWithScoresLocked(rng *rand.Rand, scores map[string]float64) (string, map[string]float64) {
+	best, bestScore := "", math.Inf(-1)
+	for _, id := range p.order {
+		score := p.sampler.Sample(rng, p.arms[id].Posterior)
+		scores[id] = score
+		if best == "" || score > bestScore {
+			best, bestScore = id, score
+		}
+	}
+	return best, scores
+}
+
+func (p *Policy) argmaxUCBWithScoresLocked(rng *rand.Rand, scores map[string]float64) (string, map[string]float64) {
+	logTotal := math.Log(float64(p.totalPulls + 1))
+	sel := p.config.Selection
+	best, bestScore := "", math.Inf(-1)
+	for _, id := range p.order {
+		arm := p.arms[id]
+		samp := p.sampler.Sample(rng, arm.Posterior)
+		var score float64
+		switch {
+		case arm.Posterior.Pulls >= sel.UntilPulls:
+			score = samp
+		case arm.Posterior.Pulls == 0:
+			score = math.Inf(1)
+		default:
+			score = samp + sel.C*math.Sqrt(logTotal/float64(arm.Posterior.Pulls))
+		}
+		scores[id] = score
+		if best == "" || score > bestScore {
+			best, bestScore = id, score
+		}
+	}
+	return best, scores
 }
 
 func (p *Policy) argmaxUCBLocked(rng *rand.Rand) string {
@@ -466,18 +519,18 @@ func (p *Policy) BestArm(minPulls uint64) (string, bool) {
 const SnapshotVersion = 1
 
 // Snapshot is a serialisable capture of a policy's learned state.
-//
-// Note that a round trip through JSON is not bit-exact: encoders and parsers
-// can shift a float by one unit in the last place. Compare restored policies
-// with a tolerance, not with equality.
+// Config is optional for wire compatibility with Rust `policy.rs:540` which
+// embeds Config; when present, `Restore` prefers it over the passed `config`
+// param. Existing Go snapshots without `config` remain valid.
 type Snapshot struct {
-	Version    uint32 `json:"version"`
-	Arms       []Arm  `json:"arms"`
-	TotalPulls uint64 `json:"total_pulls"`
+	Version    uint32  `json:"version"`
+	Config     *Config `json:"config,omitempty"`
+	Arms       []Arm   `json:"arms"`
+	TotalPulls uint64  `json:"total_pulls"`
 }
 
-// Snapshot captures the policy's learned state. Configuration and sampler are
-// not included: they are strategy, not state.
+// Snapshot captures the policy's learned state, including Config for
+// cross-language wire compatibility (Rust includes Config).
 func (p *Policy) Snapshot() Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -486,14 +539,19 @@ func (p *Policy) Snapshot() Snapshot {
 	for _, id := range p.order {
 		arms = append(arms, *p.arms[id])
 	}
-	return Snapshot{Version: SnapshotVersion, Arms: arms, TotalPulls: p.totalPulls}
+	cfg := p.config
+	return Snapshot{Version: SnapshotVersion, Config: &cfg, Arms: arms, TotalPulls: p.totalPulls}
 }
 
-// Restore rebuilds a policy from a snapshot.
+// Restore rebuilds a policy from a snapshot. If snapshot.Config is non-nil it
+// takes precedence, otherwise the passed `config` is used (backwards compat).
 func Restore(snapshot Snapshot, config Config, sampler Sampler) (*Policy, error) {
 	if snapshot.Version != SnapshotVersion {
 		return nil, fmt.Errorf("thompson: unsupported snapshot version %d (expected %d)",
 			snapshot.Version, SnapshotVersion)
+	}
+	if snapshot.Config != nil {
+		config = *snapshot.Config
 	}
 
 	p := New(config, sampler)
