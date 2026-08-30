@@ -71,7 +71,7 @@ impl CircuitBreaker {
         self.health
             .get(id)
             .and_then(|h| h.tripped_until_round)
-            .map_or(false, |until| round < until)
+            .is_some_and(|until| round < until)
     }
 
     /// Filter arms: returns ids not tripped. Empty means all tripped — caller should bypass.
@@ -90,11 +90,7 @@ impl CircuitBreaker {
 
     /// Wrap a ThompsonSampling select to respect breaker.
     /// Returns tripped-aware choice: if best arm is tripped, picks best among available.
-    pub fn select_with_breaker(
-        &self,
-        policy: &ThompsonSampling,
-        round: u64,
-    ) -> Option<String> {
+    pub fn select_with_breaker(&self, policy: &ThompsonSampling, round: u64) -> Option<String> {
         let stats = policy.stats();
         let available: Vec<&str> = self.available(
             &stats.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
