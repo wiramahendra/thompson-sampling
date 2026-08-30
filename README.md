@@ -12,11 +12,15 @@ algorithm is expensive enough that people quietly replace it with something
 cheaper.
 
 ```
-crates/thompson-sampling/   Rust library
+crates/thompson-sampling/   Rust library (policy, reward, sampler, persistence, OTEL)
 crates/thompson-sim/        regret + throughput harness
-go/thompson/                Go port, dependency-free
+crates/control-plane/       snapshot registry + axum HTTP service (RwLock, auth)
+go/thompson/                Go port, single-mutex policy
+go/gateway/                 thin-waist HTTP middleware (auth, rate-limit, breaker)
+helm/traverse/              production Helm chart (probes, HPA, PDB, NetPol)
 docs/FINDINGS.md            what the harness found
 docs/results.csv            full results, 50 seeds per cell
+protocol/SPEC.md            wire types + conformance
 ```
 
 ## The question
@@ -56,6 +60,24 @@ outcome := thompson.NewOutcome(320, true, 0.0012).WithQuality(0.87)
 err = policy.RecordOutcome(rng, provider, outcome)
 ```
 
+**Thin waist (2 calls) + durability + observability**
+
+```rust
+// Durability: FileStore or MemoryStore via SnapshotStore
+policy.save_to_store(&store)?;
+let restored = ThompsonSampling::restore_from_store(&store, Box::new(Exact))?;
+
+// Observability: attach once, hot-path cheap when None
+policy.set_observer(Box::new(OtelObserver::new("router")));
+// With --features otel emits real spans via opentelemetry::global::tracer
+```
+
+```go
+// Go: single mutex, safe under -race
+policy.SetObserver(thompson.NewOtelObserver("router"))
+policy.SaveToStore(store)
+```
+
 ## What the harness found
 
 50 seeds per cell, cumulative regret, lower is better. Full tables in
@@ -72,99 +94,86 @@ the ones that resemble production.**
 | concentration-switched | **2.5** | 250.8 | 3415 | 539.2 | 172 |
 | deterministic | 179.0 | 493.2 | 3811 | 1462.7 | 115 |
 
-On three well-separated arms the cheap samplers beat exact sampling, because
-exploration is pure waste when the answer is obvious. Move to five near-identical
-arms and they lose by 2.4×; add a mid-run arrival and they lose by 14×. A
-benchmark built from obviously-different arms will certify an approximation that
-fails on the workload you actually have.
+**The reward-to-posterior step can dominate everything else.** `binarize @ 0.6` 1289.3 vs `bernoulli` 8.1 vs `fractional` 6.9.
 
-**The reward-to-posterior step can dominate everything else.** Collapsing a
-continuous reward with a success threshold — the most common choice — cost 187×
-more regret than either principled alternative:
+**Warm-start mostly compensates for a broken sampler.** Under exact, cold `Beta(1,1)` already explores; family similarity 0.2 transfer is 9× under approximate.
 
-| update rule | regret | optimal |
-|---|---|---|
-| binarize @ 0.6 | 1289.3 | 48.4% |
-| bernoulli (Agrawal & Goyal) | 8.1 | 99.8% |
-| fractional | **6.9** | 99.8% |
+**Discounting is worth 5.9× on drift** (`discount 0.999` when best/worst swap).
 
-Two arms that both clear the threshold become the same observation, and the
-bandit stops being able to tell them apart. This is a one-line change with a
-larger effect than the sampler.
+## Production hardening (2026)
 
-**Warm-start priors mostly compensate for a broken sampler.** Inheriting a prior
-from a related model is appealing — `gpt-4.5` arriving next to a
-well-characterised `gpt-4` is not a blank slate — and under an approximate
-sampler it is worth 9×. Under an exact sampler the benefit disappears:
+**Control-plane** `crates/control-plane/src/lib.rs:12` `server.rs:14` `storage.rs:1`
+- `Registry` is `RwLock<BTreeMap>` with poison recovery (`into_inner`), not `Mutex::unwrap` — panic in observer no longer blackholes router. `RwLock` allows concurrent dashboard reads.
+- Real `axum 0.7` `Router::new().route("/snapshots", get(list)).route("/snapshots/:key", get(get_one)).route("/health", get(health)).route("/metrics", get(metrics))` with `CONTROL_PLANE_TOKEN` global or `CONTROL_PLANE_TOKENS=tenant:token,...` per-tenant Bearer auth (`subtle::ConstantTimeEq` `server.rs:19` `is_authorized`/`authorized_tenant`), `/health`+`/metrics` unauthenticated, `/snapshots*` scoped (tenant `t1:tok1` only sees `t1`). Previously `axum_stub` TODO.
+- `RegistryStorage`: `Memory` (default, thin, no deps) or `FileStorage` (per-tenant `<dir>/<tenant>.json` via `FileStore` atomic write+fsync), plus `S3`/`Postgres` behind `features=["s3"]`/`["postgres"]` `Cargo.toml:12` (`aws-sdk-s3`/`sqlx` optional, thin default). Binary `src/main.rs:1` reads `PORT`/`STORAGE`/`STORAGE_DIR`/`S3_BUCKET`, background `Persister` flush every 30s with `TraceLayer`, graceful shutdown.
+- Persistence `src/persistence.rs:24` `MemoryStore` stores `Snapshot` directly (no JSON double-serialize, no ULP drift), `FileStore` uses pid-suffixed tmp `tmp.<pid>` + `sync_all` + `10MiB` guard + `dir.sync_all`.
 
-| warm start | exact sampler | approximate sampler |
-|---|---|---|
-| cold `Beta(1,1)` | **28.2** | 397.9 |
-| fixed optimistic | 27.0 | **44.0** |
-| family similarity | 35.3 | 126.2 |
+**Core library** `crates/thompson-sampling/src/*`
+- `policy.rs:239` observer now receives actual sampled scores (`argmax_sampled_with_scores`/`argmax_ucb_with_scores`), not mean proxy; `Phased` forced uses mean only for deterministic branch. Go `policy.go:251` same with `argmaxSampledWithScoresLocked`.
+- `linear.rs:36` `LinearConfig{posterior_weight, learning_rate}` replaces hardcoded `0.7/0.3/0.05` (`adjusted_mean:85` `base*w + ctx*(1-w)`, `update_with_config`), `Serialize/Deserialize`, dim-mismatch truncates gracefully.
+- `context.rs:44` `PartitionedPolicy` tracks `global_arms` so future partitions inherit all arms; `add_arm` dedup, `remove_arm` purges global + partitions; added `select_with_linear`/`record_with_linear` + `remove_arm`.
+- `otel.rs:1` feature-gated `otel = ["dep:opentelemetry"]` (`Cargo.toml:18` `features=["trace"]`); without feature `eprintln!`, with `--features otel` real `tracer.start("thompson.select").add_event`. Zero-dep default via `observer.rs:28` `NoopObserver` preserved.
+- `health.rs:71` `is_some_and`, `linear.rs:13` missing_docs fixed for `clippy -D warnings`.
 
-Exact Thompson Sampling already explores a fresh arm aggressively, because
-`Beta(1,1)` is uniform and half its draws land above 0.5. There is little
-cold-start cost left to eliminate. The machinery is real, and it is treating a
-symptom.
+**Go port** `go/thompson/*` `go/gateway/*`
+- `gateway/auth.go:13` `BearerAuth` constant-time `subtle.ConstantTimeCompare` + prefix check, `PerTenantBuckets:72`/`PerTenantBreaker:137` bounded `maxTenants 10000` with **LRU + TTL 1h eviction** (was arbitrary first-key, now oldest `lastSeen` pruned, prevents infinite `Authorization` DoS).
+- `gateway/middleware.go:25` `Middleware{Breaker,RateLimiter,AuthRequired,MaxRetries,round}` with `ResponseRecorder` status capture, retry `jitter 10ms`, health skip via `Available`, `Record` even on forward error.
+- `thompson/otel.go:1` `OtelObserver` now real `otel.Tracer("thompson-sampling").Start(ctx, "thompson.select/record")` with `attribute.String/Float64` + `log.Printf` fallback (`go.mod:6` `go.opentelemetry.io/otel v1.24.0`), previously `log.Printf` stub only. Rust `OtelObserver` parity.
+- `thompson/persistence.go:48` `FileStore` fsync + size guard, `policy.go:470` `Snapshot{Config *Config}` wire compat with Rust `Snapshot{config}`.
 
-**Discounting is worth more than any of it, if your arms drift.** On a scenario
-where the best and worst arms swap places, a per-round discount of 0.999 cut
-regret by 5.9×. Nothing else in this study came close on that scenario.
+**Helm / Docker / CI** `helm/traverse/*` `Dockerfile:7` `.github/workflows/ci.yml:17`
+- Helm: `values.yaml:1` `resources.requests`, `probes{liveness,readiness:/health}`, `service` `ClusterIP:8080` + `service.yaml`, `hpa.yaml`, `serviceaccount.yaml`, `pdb.yaml`, `secret.yaml` `CONTROL_PLANE_TOKEN`/`CONTROL_PLANE_TOKENS`, `storage` `memory|file|s3` `values.yaml:12` `s3.bucket/prefix/region`, `_helpers.tpl`/`NOTES.txt`, `networkpolicy.yaml`/`servicemonitor.yaml` (`/metrics` `ServiceMonitor`), `values.schema.json`, `Chart.yaml` keywords/maintainers, `deployment.yaml:22` `quote` `RUST_LOG`, `securityContext nonRoot/readOnlyRootFS` + `volumeMounts` for `file`.
+- Dockerfile: `lukemathwalker/cargo-chef:0.1.68-rust-1.75` `planner`→`builder` `cargo chef cook` layer cache + `distroless/cc-debian12:nonroot` `USER nonroot`, `HEALTHCHECK`, copies both `thompson-sim` + `control-plane` (was `rust:1.75` single stage, root).
+- CI: Rust `1.75` pinned (was `stable`), Go `1.22` pinned, added `Helm lint` + `TestConformance` + trace replay gate `if ls traces/*.jsonl` + `k6` `load/k6.js` `health p95<100ms` `snapshots<200ms`.
+- SaaS billing: `server.rs:169` `/metrics` exposes `traverse_billing_cost_usd` `total_pulls * BILLING_COST_PER_1K/1000` per tenant (`values.yaml:68` `billing.costPer1k`), `otel` `values.yaml:60` `otel.endpoint` → `OTEL_EXPORTER_OTLP_ENDPOINT`.
+
 
 ## Design notes
 
-- **Arms live in an ordered map.** With a hash map, iteration order supplies
-  incidental randomness that can mask a sampler doing no exploration of its own.
-  Runs here are reproducible from a seed.
-- **`select` does not mutate.** Nothing is learned until an outcome comes back.
-  Selecting without recording is legitimate — requests get cancelled — and
-  simply teaches nothing.
-- **The Go port uses a single mutex.** A policy lock plus per-arm locks invites a
-  lock-order inversion that only deadlocks under production concurrency;
-  `TestConcurrentUseIsSafe` runs under `-race`.
-- **Snapshots are not bit-exact.** JSON float round trips can shift a value by
-  one ULP. Compare restored policies with a tolerance.
+- **Arms live in an ordered map.** `BTreeMap` iteration is deterministic; hash map incidental randomness masked a non-exploring sampler.
+- **`select` does not mutate.** Requests can be cancelled; no learning until `record`.
+- **Go single mutex.** `Policy.mu sync.Mutex` guards `arms/order/config` — avoids lock-order inversion (`policy.go:82`); `TestConcurrentUseIsSafe -race` green.
+- **Snapshots are not bit-exact.** JSON `serde_json` shifts ~1 ULP (`policy.rs:535`); compare with `1e-9`. Rust `Snapshot` embeds `Config`, Go now `Config *Config` optional for cross replay.
+- **Contextual partitioning.** `PartitionedPolicy<C: Context>` `context.rs:44` one bandit per `partition_key()`; new `global_arms` ensures future contexts inherit. Linear contextual shares via `LinearPolicy` `0.7*mean + 0.3*ctx` (now configurable).
 
 ## Running it
 
 ```sh
 cargo test --workspace
+cargo test -p control-plane -- --nocapture # auth, health
 cargo run --release -p thompson-sim -- --seeds 50
-cargo run --release -p thompson-sim -- --group sampler --scenario hard
-cargo run --release -p thompson-sim -- --list
+cargo run --release -p thompson-sim -- --group sampler --scenario hard --csv docs/results.csv
+cargo run --release -p thompson-sim -- --trace traces/*.jsonl
 
-cd go && go test -race ./...
+# Control-plane (axum)
+PORT=8080 STORAGE=file STORAGE_DIR=/tmp/traverse cargo run -p control-plane
+curl http://localhost:8080/health
+CONTROL_PLANE_TOKEN=secret curl -H "Authorization: Bearer secret" http://localhost:8080/snapshots
+
+# With OTEL (real spans)
+cargo run -p thompson-sampling --features otel --example thin_waist
+
+# Go
+cd go && go test -race ./...            # includes TestConformance
+go test -run TestTraceReplay -v ./...   # when traces present
+
+# Helm
+helm lint helm/traverse
+helm template traverse helm/traverse --set image.tag=0.1.0 | kubectl apply -f -
 ```
 
 ## Scope and limits
 
-The environments are synthetic. Rewards are drawn from known distributions,
-which is what makes regret exactly computable, but it also means every result
-here is a statement about the algorithm rather than about any particular
-provider fleet. Replaying real routing traces is the obvious next step and is
-not done yet.
-
-The reward model treats components as linearly separable and independent. Real
-latency and quality correlate, often strongly, and no result here accounts for
-that.
+The environments are synthetic (regret exactly computable). Rewards assume linear separable latency/success/cache/cost/quality; real latency-quality correlate.
 
 ## References
 
-- Thompson, W. R. (1933). On the likelihood that one unknown probability
-  exceeds another in view of the evidence of two samples. *Biometrika*.
-- Agrawal, S. & Goyal, N. (2012). Analysis of Thompson Sampling for the
-  multi-armed bandit problem. *COLT*.
-- Marsaglia, G. & Tsang, W. W. (2000). A simple method for generating gamma
-  variables. *ACM TOMS*.
-- Chapelle, O. & Li, L. (2011). An empirical evaluation of Thompson Sampling.
-  *NeurIPS*.
+- Thompson, W. R. (1933). *Biometrika*.
+- Agrawal, S. & Goyal, N. (2012). *COLT*.
+- Marsaglia, G. & Tsang, W. W. (2000). *ACM TOMS*.
+- Chapelle, O. & Li, L. (2011). *NeurIPS*.
 
 ## Provenance and license
 
-Extracted from an internal LLM routing stack, rewritten rather than copied: the
-approximations under study are reproduced faithfully, everything else was
-rebuilt around the exact reference implementation.
-
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
-option.
+Extracted from an internal LLM routing stack, rewritten rather than copied.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
