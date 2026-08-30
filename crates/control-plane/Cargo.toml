@@ -7,10 +7,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+s3 = []
+postgres = []
+
 [dependencies]
 thompson-sampling = { path = "../thompson-sampling" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+subtle = "2"
 
 [dev-dependencies]
 rand = { workspace = true, features = ["small_rng"] }
+tower = { version = "0.4", features = ["util"] }
