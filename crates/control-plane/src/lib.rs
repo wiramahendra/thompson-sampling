@@ -4,6 +4,8 @@
 //! without owning the data path. Gateway `SaveToStore` pushes snapshots;
 //! dashboard pulls via this registry. Future: S3/Postgres backend.
 
+pub mod server;
+
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use thompson_sampling::policy::Snapshot;
