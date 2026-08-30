@@ -1,19 +1,23 @@
-//! Control plane scaffold: snapshot registry with versioned Config.
+//! Thin-waist control plane: in-memory snapshot registry.
 //!
-//! Thin waist control plane keeps policy Config and Snapshots durable
-//! without owning the data path. Gateway `SaveToStore` pushes snapshots;
-//! dashboard pulls via this registry. Future: S3/Postgres backend.
+//! Keeps policy `Snapshot`s durable without owning the data path.
+//! Gateway `SaveToStore` pushes snapshots; dashboard pulls via this registry.
 
 pub mod dashboard;
 pub mod server;
+pub mod storage;
+pub mod ui;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use thompson_sampling::policy::Snapshot;
 
-/// In-memory registry — replace with S3/Postgres in production.
+/// In-memory registry — thin, no external deps.
+/// `RwLock` allows concurrent dashboard reads; poison is recovered so an
+/// observer panic doesn't blackhole the router. Use `storage::FileStorage`
+/// if you need local durability; no S3/Postgres in this crate.
 pub struct Registry {
-    snapshots: Mutex<BTreeMap<String, Snapshot>>,
+    snapshots: RwLock<BTreeMap<String, Snapshot>>,
 }
 
 impl Default for Registry {
@@ -23,31 +27,47 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Create empty registry.
     pub fn new() -> Self {
         Self {
-            snapshots: Mutex::new(BTreeMap::new()),
+            snapshots: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    fn read_map(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Snapshot>> {
+        self.snapshots.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_map(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Snapshot>> {
+        self.snapshots.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Save snapshot for tenant `key`.
     pub fn put(&self, key: String, snapshot: Snapshot) {
-        self.snapshots.lock().unwrap().insert(key, snapshot);
+        self.write_map().insert(key, snapshot);
     }
 
     /// Load snapshot for tenant `key`.
     pub fn get(&self, key: &str) -> Option<Snapshot> {
-        self.snapshots.lock().unwrap().get(key).cloned()
+        self.read_map().get(key).cloned()
     }
 
     /// List tenant keys.
     pub fn list(&self) -> Vec<String> {
-        self.snapshots.lock().unwrap().keys().cloned().collect()
+        self.read_map().keys().cloned().collect()
     }
 
     /// JSON dump for dashboard.
     pub fn to_json(&self) -> String {
-        let map = self.snapshots.lock().unwrap();
+        let map = self.read_map();
         serde_json::to_string_pretty(&*map).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// JSON for single tenant, if present.
+    pub fn to_json_for(&self, key: &str) -> Option<String> {
+        let map = self.read_map();
+        let snap = map.get(key)?;
+        serde_json::to_string_pretty(snap).ok()
     }
 }
 
