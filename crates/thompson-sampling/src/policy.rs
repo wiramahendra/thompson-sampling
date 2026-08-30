@@ -7,7 +7,9 @@ use crate::observer::PolicyObserver;
 use crate::posterior::{Posterior, UpdateRule};
 use crate::reward::{Outcome, RewardPolicy};
 use crate::sampler::{BetaSampler, Exact};
-use crate::selection::{PhasedStrategy, SelectionStrategy, ThompsonStrategy, UcbRegularizedStrategy};
+use crate::selection::{
+    PhasedStrategy, SelectionStrategy, ThompsonStrategy, UcbRegularizedStrategy,
+};
 use crate::warm_start::{prior_for, InformedPrior, WarmStart};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -233,41 +235,50 @@ impl ThompsonSampling {
             return Err(Error::NoArms);
         }
 
-        let chosen = match self.config.selection {
-            Selection::Thompson => self.argmax_sampled(rng, |_| true),
-            Selection::UcbRegularized { c, until_pulls } => self.argmax_ucb(rng, c, until_pulls),
+        // When observer is present, capture the actual sampled scores that
+        // produced the decision (no double RNG). When absent, take fast path
+        // without allocation.
+        let (chosen, sampled_scores) = match self.config.selection {
+            Selection::Thompson => {
+                if self.observer.is_some() {
+                    self.argmax_sampled_with_scores(rng, |_| true)
+                } else {
+                    (self.argmax_sampled(rng, |_| true), Vec::new())
+                }
+            }
+            Selection::UcbRegularized { c, until_pulls } => {
+                if self.observer.is_some() {
+                    self.argmax_ucb_with_scores(rng, c, until_pulls)
+                } else {
+                    (self.argmax_ucb(rng, c, until_pulls), Vec::new())
+                }
+            }
             Selection::Phased {
                 bootstrap,
                 min_pulls_for_exploit,
             } => {
                 let forced = bootstrap.max(min_pulls_for_exploit);
                 if let Some(id) = self.least_pulled_below(forced) {
-                    id
+                    // Phased forced choice is deterministic; scores are means for observability.
+                    let scores = if self.observer.is_some() {
+                        self.arms
+                            .values()
+                            .map(|a| (a.id.as_str(), a.posterior.mean()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (id, scores)
+                } else if self.observer.is_some() {
+                    self.argmax_sampled_with_scores(rng, |_| true)
                 } else {
-                    self.argmax_sampled(rng, |_| true)
+                    (self.argmax_sampled(rng, |_| true), Vec::new())
                 }
             }
         };
 
-        // Best-effort observability: re-sample scores for the observer without
-        // affecting the decision (the decision already used the sampler's draw).
-        // For exact reproducibility the observer sees the same chosen arm but
-        // fresh draws for candidates — document this if you need bit-identical
-        // replay, use `select_with` with a deterministic sampler.
         if let Some(obs) = &self.observer {
-            // Collect current sampler scores for observability (cheap, not on
-            // critical path in production if observer is None).
-            let mut scores: Vec<(&str, f64)> = Vec::new();
-            // We cannot re-use the exact draws that decided `chosen` without
-            // threading them through; for observability a second draw is fine.
-            // If you need exact draws, implement `SelectionStrategy` and hook
-            // there.
-            for arm in self.arms.values() {
-                // Use posterior mean as stable proxy when observer is attached;
-                // avoids double RNG consumption on hot path.
-                scores.push((arm.id.as_str(), arm.posterior.mean()));
-            }
-            obs.on_select(&chosen, &scores);
+            obs.on_select(&chosen, &sampled_scores);
         }
 
         Ok(chosen)
@@ -301,10 +312,9 @@ impl ThompsonSampling {
     pub fn selection_strategy(&self) -> Box<dyn SelectionStrategy> {
         match self.config.selection {
             Selection::Thompson => Box::new(ThompsonStrategy),
-            Selection::UcbRegularized { c, until_pulls } => Box::new(UcbRegularizedStrategy {
-                c,
-                until_pulls,
-            }),
+            Selection::UcbRegularized { c, until_pulls } => {
+                Box::new(UcbRegularizedStrategy { c, until_pulls })
+            }
             Selection::Phased {
                 bootstrap,
                 min_pulls_for_exploit,
@@ -330,6 +340,29 @@ impl ThompsonSampling {
         best.expect("filter matched at least one arm").0.to_string()
     }
 
+    fn argmax_sampled_with_scores(
+        &self,
+        rng: &mut dyn RngCore,
+        filter: impl Fn(&Arm) -> bool,
+    ) -> (String, Vec<(&str, f64)>) {
+        let mut best: Option<(&str, f64)> = None;
+        let mut scores: Vec<(&str, f64)> = Vec::with_capacity(self.arms.len());
+        for arm in self.arms.values() {
+            if !filter(arm) {
+                continue;
+            }
+            let score = self.sampler.sample(rng, &arm.posterior);
+            scores.push((arm.id.as_str(), score));
+            if best.map_or(true, |(_, b)| score > b) {
+                best = Some((&arm.id, score));
+            }
+        }
+        (
+            best.expect("filter matched at least one arm").0.to_string(),
+            scores,
+        )
+    }
+
     fn argmax_ucb(&self, rng: &mut dyn RngCore, c: f64, until_pulls: u64) -> String {
         // `ln(total_pulls)` is undefined at zero and negative at one, either of
         // which poisons every comparison with NaN. Shifting by one keeps the
@@ -352,6 +385,32 @@ impl ThompsonSampling {
             }
         }
         best.expect("arm set is non-empty").0.to_string()
+    }
+
+    fn argmax_ucb_with_scores(
+        &self,
+        rng: &mut dyn RngCore,
+        c: f64,
+        until_pulls: u64,
+    ) -> (String, Vec<(&str, f64)>) {
+        let log_total = ((self.total_pulls + 1) as f64).ln();
+        let mut best: Option<(&str, f64)> = None;
+        let mut scores: Vec<(&str, f64)> = Vec::with_capacity(self.arms.len());
+        for arm in self.arms.values() {
+            let sample = self.sampler.sample(rng, &arm.posterior);
+            let score = if arm.pulls() >= until_pulls {
+                sample
+            } else if arm.pulls() == 0 {
+                f64::INFINITY
+            } else {
+                sample + c * (log_total / arm.pulls() as f64).sqrt()
+            };
+            scores.push((arm.id.as_str(), score));
+            if best.map_or(true, |(_, b)| score > b) {
+                best = Some((&arm.id, score));
+            }
+        }
+        (best.expect("arm set is non-empty").0.to_string(), scores)
     }
 
     /// The least-pulled arm, if any arm has fewer than `threshold` pulls.
