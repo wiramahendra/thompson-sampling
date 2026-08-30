@@ -14,7 +14,12 @@ struct MetricsObserver {
 
 impl PolicyObserver for MetricsObserver {
     fn on_select(&self, chosen: &str, _scores: &[(&str, f64)]) {
-        *self.selects.lock().unwrap().entry(chosen.to_string()).or_insert(0) += 1;
+        *self
+            .selects
+            .lock()
+            .unwrap()
+            .entry(chosen.to_string())
+            .or_insert(0) += 1;
     }
     fn on_record(&self, arm: &str, reward: f64, _posterior: &Posterior) {
         let mut m = self.rewards.lock().unwrap();
@@ -35,10 +40,16 @@ impl MetricsObserver {
         }
         println!("# HELP thompson_reward_mean mean reward per arm");
         for (arm, (sum, cnt)) in self.rewards.lock().unwrap().iter() {
-            println!("thompson_reward_mean{{arm=\"{arm}\"}} {:.3}", sum / *cnt as f64);
+            println!(
+                "thompson_reward_mean{{arm=\"{arm}\"}} {:.3}",
+                sum / *cnt as f64
+            );
         }
         println!("# HELP thompson_discounts_total discounts applied");
-        println!("thompson_discounts_total {}", *self.discounts.lock().unwrap());
+        println!(
+            "thompson_discounts_total {}",
+            *self.discounts.lock().unwrap()
+        );
     }
 }
 
@@ -47,7 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use thompson_sampling::ThompsonSampling;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
     let obs = MetricsObserver::default();
-    let mut policy = ThompsonSampling::with_defaults(["a", "b"]).with_observer(Box::new(obs.clone()));
+    let mut policy =
+        ThompsonSampling::with_defaults(["a", "b"]).with_observer(Box::new(obs.clone()));
     for _ in 0..20 {
         let id = policy.select(&mut rng)?;
         let reward = if id == "a" { 0.9 } else { 0.1 };
@@ -55,7 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     obs.print_prometheus();
     for s in policy.stats() {
-        println!("arm {} mean {:.3} pulls {} width {:.3}", s.id, s.posterior_mean, s.pulls, s.credible_width);
+        println!(
+            "arm {} mean {:.3} pulls {} width {:.3}",
+            s.id, s.posterior_mean, s.pulls, s.credible_width
+        );
     }
     Ok(())
 }
