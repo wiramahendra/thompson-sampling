@@ -47,6 +47,8 @@ pub struct PartitionedPolicy<C: Context> {
     partitions: BTreeMap<String, ThompsonSampling>,
     config: Config,
     sampler_factory: Box<dyn Fn() -> Box<dyn BetaSampler> + Send + Sync>,
+    /// Global arm registry so future partitions inherit all arms.
+    global_arms: Vec<String>,
     _marker: std::marker::PhantomData<C>,
 }
 
@@ -69,6 +71,7 @@ impl<C: Context> PartitionedPolicy<C> {
             partitions: BTreeMap::new(),
             config,
             sampler_factory: Box::new(sampler_factory),
+            global_arms: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -77,20 +80,25 @@ impl<C: Context> PartitionedPolicy<C> {
         let key = ctx.partition_key();
         if !self.partitions.contains_key(&key) {
             let sampler = (self.sampler_factory)();
-            self.partitions
-                .insert(key.clone(), ThompsonSampling::new(self.config, sampler));
+            let mut policy = ThompsonSampling::new(self.config, sampler);
+            // Inherit global arms for future partitions
+            for arm_id in &self.global_arms {
+                policy.add_arm(arm_id.clone());
+            }
+            self.partitions.insert(key.clone(), policy);
         }
         self.partitions.get_mut(&key).unwrap()
     }
 
-    /// Register arm in all partitions (or lazily per context).
+    /// Register arm in all partitions and future partitions.
     pub fn add_arm(&mut self, id: String) {
+        if self.global_arms.contains(&id) {
+            return;
+        }
+        self.global_arms.push(id.clone());
         for p in self.partitions.values_mut() {
             p.add_arm(id.clone());
         }
-        // Also ensure default partition has it for future contexts
-        // We do not eagerly create all partitions; they inherit on first use.
-        // To guarantee arm exists, caller should `add_arm_to_all` or ensure ctx exists first.
     }
 
     /// Register arm in a specific context partition.
@@ -108,6 +116,52 @@ impl<C: Context> PartitionedPolicy<C> {
         self.ensure_partition(ctx).record(rng, id, reward)
     }
 
+    /// Select with linear contextual adjustment — `linear.rs:54` `adjusted_mean`.
+    pub fn select_with_linear(
+        &mut self,
+        ctx: &C,
+        rng: &mut dyn RngCore,
+        linear: &crate::linear::LinearPolicy,
+        features: &[f64],
+    ) -> Result<String> {
+        // Delegate to underlying ThompsonSampling if it has linear support,
+        // otherwise do manual adjusted sampling using linear policy.
+        let part = self.ensure_partition(ctx);
+        // If policy has at least one arm, use linear adjusted sampling
+        // We replicate 0.7/0.3 logic via LinearPolicy::adjusted_mean
+        let mut best: Option<(String, f64)> = None;
+        for arm in part.stats() {
+            // Need posterior; use stats then fetch arm directly
+            let posterior = part.arm(&arm.id).unwrap().posterior;
+            let adj = linear.adjusted_mean(&posterior, features);
+            // Sample around adjusted mean with small noise to retain exploration
+            let noise: f64 = {
+                use rand::Rng;
+                rng.gen_range(-0.01..0.01)
+            };
+            let score = (adj + noise).clamp(0.0, 1.0);
+            if best.as_ref().map_or(true, |(_, b)| score > *b) {
+                best = Some((arm.id.clone(), score));
+            }
+        }
+        best.map(|(id, _)| id).ok_or(crate::error::Error::NoArms)
+    }
+
+    /// Record and update linear weights — shares strength across contexts.
+    pub fn record_with_linear(
+        &mut self,
+        ctx: &C,
+        rng: &mut dyn RngCore,
+        linear: &mut crate::linear::LinearPolicy,
+        id: &str,
+        reward: f64,
+        features: &[f64],
+    ) -> Result<()> {
+        self.record(ctx, rng, id, reward)?;
+        linear.update_with_config(features, reward);
+        Ok(())
+    }
+
     /// Number of partitions.
     pub fn len_partitions(&self) -> usize {
         self.partitions.len()
@@ -120,6 +174,14 @@ impl<C: Context> PartitionedPolicy<C> {
             .map(|(k, v)| (k.clone(), v.snapshot()))
             .collect()
     }
+
+    /// Remove arm from all partitions and future partitions.
+    pub fn remove_arm(&mut self, id: &str) {
+        self.global_arms.retain(|a| a != id);
+        for p in self.partitions.values_mut() {
+            p.remove_arm(id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,10 +193,8 @@ mod tests {
 
     #[test]
     fn partitioned_context_isolates_learning() {
-        let mut policy = PartitionedPolicy::<SimpleContext>::new(
-            Config::default(),
-            || Box::new(Exact),
-        );
+        let mut policy =
+            PartitionedPolicy::<SimpleContext>::new(Config::default(), || Box::new(Exact));
         let ctx_code = SimpleContext("code".to_string());
         let ctx_chat = SimpleContext("chat".to_string());
 
@@ -151,8 +211,14 @@ mod tests {
         }
 
         assert_eq!(policy.len_partitions(), 2);
-        assert_eq!(policy.partitions[&ctx_code.partition_key()].best_arm(1), Some("a"));
-        assert_eq!(policy.partitions[&ctx_chat.partition_key()].best_arm(1), Some("b"));
+        assert_eq!(
+            policy.partitions[&ctx_code.partition_key()].best_arm(1),
+            Some("a")
+        );
+        assert_eq!(
+            policy.partitions[&ctx_chat.partition_key()].best_arm(1),
+            Some("b")
+        );
     }
 
     #[test]
@@ -165,5 +231,37 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(2);
         let chosen = policy.select(&ctx, &mut rng).unwrap();
         assert!(["a", "b"].contains(&chosen.as_str()));
+    }
+
+    #[test]
+    fn global_arms_fan_out_to_future_partitions() {
+        let mut policy =
+            PartitionedPolicy::<SimpleContext>::new(Config::default(), || Box::new(Exact));
+        policy.add_arm("global-a".to_string());
+        policy.add_arm("global-b".to_string());
+        // Create partition after global arms — should inherit
+        let ctx = SimpleContext("new_task".to_string());
+        let mut rng = SmallRng::seed_from_u64(3);
+        let chosen = policy.select(&ctx, &mut rng).unwrap();
+        assert!(["global-a", "global-b"].contains(&chosen.as_str()));
+        // Remove should affect future partitions too
+        policy.remove_arm("global-a");
+        let ctx2 = SimpleContext("another".to_string());
+        let chosen2 = policy.select(&ctx2, &mut rng).unwrap();
+        assert_eq!(chosen2, "global-b");
+    }
+
+    #[test]
+    fn add_arm_dedup_and_remove() {
+        let mut policy =
+            PartitionedPolicy::<SimpleContext>::new(Config::default(), || Box::new(Exact));
+        policy.add_arm("a".to_string());
+        policy.add_arm("a".to_string()); // dedup
+        assert_eq!(policy.global_arms.len(), 1);
+        policy.remove_arm("a");
+        assert!(policy.global_arms.is_empty());
+        let ctx = SimpleContext("x".to_string());
+        let mut rng = SmallRng::seed_from_u64(4);
+        assert!(policy.select(&ctx, &mut rng).is_err());
     }
 }
