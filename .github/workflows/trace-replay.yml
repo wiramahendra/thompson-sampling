@@ -19,6 +19,12 @@ jobs:
       - run: cargo test -p thompson-sampling --test stress --quiet
       - run: cargo run --release -p thompson-sim -- --seeds 50 --csv docs/results.csv
       - run: cat docs/results.csv
-      # When traces/ exists, add:
-      # - run: cargo run --release -p thompson-sim -- --trace traces/*.jsonl
-      # - run: go test -race ./... --trace
+      - name: Trace replay (if traces present)
+        run: |
+          if ls traces/*.jsonl 1>/dev/null 2>&1; then
+            cargo run --release -p thompson-sim -- --trace traces/*.jsonl --csv docs/results-trace.csv
+            cat docs/results-trace.csv
+            go test -race ./... -run TestTraceReplay -v
+          else
+            echo "no traces, skipping replay"
+          fi
