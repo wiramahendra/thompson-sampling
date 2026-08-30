@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/wiramahendra/thompson-sampling/go/thompson"
@@ -40,8 +41,4 @@ func formatMetric(name, arm string, value float64) string {
 	return name + "{arm=\"" + arm + "\"} " + floatToString(value) + "\n"
 }
 
-func floatToString(v float64) string {
-	// Use standard formatting; import fmt lazily via extra file if needed
-	// Here we use Sprintf via fmt (allowed to import)
-	return formatFloat(v)
-}
+func floatToString(v float64) string { return fmt.Sprintf("%g", v) }
