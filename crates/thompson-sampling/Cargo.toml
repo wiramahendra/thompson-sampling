@@ -15,5 +15,14 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+otel = ["dep:opentelemetry"]
+
+[dependencies.opentelemetry]
+version = "0.22"
+optional = true
+package = "opentelemetry"
+features = ["trace"]
+
 [dev-dependencies]
 rand = { workspace = true, features = ["small_rng"] }
