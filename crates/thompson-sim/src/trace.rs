@@ -27,7 +27,8 @@ pub struct TraceRecord {
 
 /// Load trace records from JSONL.
 pub fn load_trace(path: &Path) -> Result<Vec<TraceRecord>, String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut out = Vec::new();
     for (idx, line) in data.lines().enumerate() {
         let line = line.trim();
@@ -59,7 +60,7 @@ pub fn scenario_from_trace(records: &[TraceRecord], name: &'static str) -> Scena
         .map(|id| {
             let (sum, cnt) = means.get(&id).cloned().unwrap_or((0.0, 0));
             let p = if cnt > 0 { sum / cnt as f64 } else { 0.5 };
-            ArmSpec::fixed(&leak(id), p.clamp(0.0, 1.0))
+            ArmSpec::fixed(leak(id), p.clamp(0.0, 1.0))
         })
         .collect();
     Scenario {
@@ -113,7 +114,7 @@ impl TraceReplay {
         }
         let arms: Vec<ArmSpec> = ids
             .into_iter()
-            .map(|id| ArmSpec::fixed(&leak(id), 0.5))
+            .map(|id| ArmSpec::fixed(leak(id), 0.5))
             .collect();
         let horizon = by_round.len();
         let scenario = Scenario {
@@ -150,9 +151,33 @@ mod tests {
     #[test]
     fn trace_replay_round_trip() {
         let records = vec![
-            TraceRecord { id: "openai/gpt-4".to_string(), t: Some(0), reward: Some(0.9), latency_ms: None, success: None, cost_usd: None, quality: None },
-            TraceRecord { id: "meta/llama-3".to_string(), t: Some(0), reward: Some(0.2), latency_ms: None, success: None, cost_usd: None, quality: None },
-            TraceRecord { id: "openai/gpt-4".to_string(), t: Some(1), reward: Some(0.8), latency_ms: None, success: None, cost_usd: None, quality: None },
+            TraceRecord {
+                id: "openai/gpt-4".to_string(),
+                t: Some(0),
+                reward: Some(0.9),
+                latency_ms: None,
+                success: None,
+                cost_usd: None,
+                quality: None,
+            },
+            TraceRecord {
+                id: "meta/llama-3".to_string(),
+                t: Some(0),
+                reward: Some(0.2),
+                latency_ms: None,
+                success: None,
+                cost_usd: None,
+                quality: None,
+            },
+            TraceRecord {
+                id: "openai/gpt-4".to_string(),
+                t: Some(1),
+                reward: Some(0.8),
+                latency_ms: None,
+                success: None,
+                cost_usd: None,
+                quality: None,
+            },
         ];
         let replay = TraceReplay::new(records).unwrap();
         assert_eq!(replay.horizon(), 2);
