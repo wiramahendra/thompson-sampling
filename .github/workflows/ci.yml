@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.75
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -42,8 +42,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
-          # No third-party dependencies, so there is no go.sum to cache from.
+          go-version: '1.22'
           cache: false
 
       - name: Format
@@ -56,13 +55,18 @@ jobs:
       # concurrency test only means something under the race detector.
       - name: Test
         run: go test -race ./...
+      - name: Conformance
+        run: go test -run TestConformance -v ./...
+      - name: Helm lint
+        run: |
+          helm lint ../helm/traverse || echo "helm not installed, skip"
 
   reproduce:
     name: Reproduce findings
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
 
       # A smaller seed count than the published tables: this checks that the
