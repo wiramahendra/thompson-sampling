@@ -1,0 +1,24 @@
+name: trace-replay
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: cargo test --workspace --quiet
+      - run: cargo check -p thompson-sampling --examples
+      - run: cargo test -p thompson-sampling --test stress --quiet
+      - run: cargo run --release -p thompson-sim -- --seeds 50 --csv docs/results.csv
+      - run: cat docs/results.csv
+      # When traces/ exists, add:
+      # - run: cargo run --release -p thompson-sim -- --trace traces/*.jsonl
+      # - run: go test -race ./... --trace
