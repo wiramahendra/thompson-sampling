@@ -22,9 +22,11 @@ pub trait SnapshotStore: Send + Sync + std::fmt::Debug {
 }
 
 /// In-memory store — useful for tests and for embedding the harness.
+/// Stores `Snapshot` directly (no JSON round-trip) to avoid double serialize
+/// and ULP drift noted in `policy.rs:535`.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    inner: std::sync::Mutex<Option<String>>,
+    inner: std::sync::RwLock<Option<Snapshot>>,
 }
 
 impl MemoryStore {
@@ -36,17 +38,14 @@ impl MemoryStore {
 
 impl SnapshotStore for MemoryStore {
     fn save(&self, snapshot: &Snapshot) -> Result<()> {
-        let json = snapshot.to_json()?;
-        *self.inner.lock().unwrap() = Some(json);
+        let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *w = Some(snapshot.clone());
         Ok(())
     }
 
     fn load(&self) -> Result<Option<Snapshot>> {
-        let guard = self.inner.lock().unwrap();
-        match &*guard {
-            None => Ok(None),
-            Some(json) => Ok(Some(Snapshot::from_json(json)?)),
-        }
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        Ok(guard.clone())
     }
 }
 
@@ -71,20 +70,49 @@ impl FileStore {
 impl SnapshotStore for FileStore {
     fn save(&self, snapshot: &Snapshot) -> Result<()> {
         let json = snapshot.to_json()?;
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, json.as_bytes())
-            .map_err(|e| Error::Decode(format!("write {}: {e}", tmp.display())))?;
+        // Use pid + random suffix to avoid collision when multiple processes
+        // save concurrently to the same path (with_extension("tmp") would collide).
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        // Write to tmp, fsync, then rename atomically.
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| Error::Decode(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| Error::Decode(format!("write {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::Decode(format!("fsync {}: {e}", tmp.display())))?;
+        }
+        // Enforce size limit on read path — avoid unbounded allocation on untrusted snapshot.
+        let meta = std::fs::metadata(&tmp)
+            .map_err(|e| Error::Decode(format!("stat {}: {e}", tmp.display())))?;
+        if meta.len() > 10 * 1024 * 1024 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Decode("snapshot too large (>10MiB)".to_string()));
+        }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| Error::Decode(format!("rename {}: {e}", tmp.display())))?;
+        // Fsync parent dir for durability on crash (best-effort).
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
     fn load(&self) -> Result<Option<Snapshot>> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(json) => Ok(Some(Snapshot::from_json(&json)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Decode(format!("read {}: {e}", self.path.display()))),
+        let json = match std::fs::read_to_string(&self.path) {
+            Ok(j) => j,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Decode(format!("read {}: {e}", self.path.display()))),
+        };
+        if json.len() > 10 * 1024 * 1024 {
+            return Err(Error::Decode("snapshot too large (>10MiB)".to_string()));
         }
+        Ok(Some(Snapshot::from_json(&json)?))
     }
 }
 
